@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+data/cache/
+data/*.json
+data/*.db
+*.swp
+*.save
+.DS_Store
+*.log
+*.ckpt
+*.pt
+.cache/
