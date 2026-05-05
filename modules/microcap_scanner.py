@@ -340,7 +340,7 @@ class MicrocapScanner:
         start = time.time()
 
         # Sources
-        binance_tokens = self.fetch_binance_top(top_n=150)
+        binance_tokens = self.fetch_binance_top(top_n=200)
         if not binance_tokens:
             return {
                 "error": "Binance inaccessible",
@@ -384,11 +384,13 @@ class MicrocapScanner:
             cg = cg_data.get(t["symbol"], {})
             mc = cg.get("market_cap", t.get("market_cap", 0)) or 0
 
+            # Si mc == 0 = pas de data CoinGecko = on garde (DEX ou token non listé)
             if mc > 0 and (mc < min_mc or mc > max_mc):
                 continue
 
             sc = self.compute_gem_score(t, cg)
-            scored.append({**t, "score": sc})
+            if sc["total_score"] >= 40:
+                scored.append({**t, "score": sc})
 
         scored.sort(key=lambda x: x["score"]["total_score"], reverse=True)
 
@@ -408,15 +410,15 @@ class MicrocapScanner:
         gems = [
             t for t in scored
             if t["score"]["recommendation"] == "GEM_SWING"
-            and t["score"]["total_score"] >= 65
-        ][:10]
+            and t["score"]["total_score"] >= 60
+        ][:15]
 
         duration = round(time.time() - start, 2)
         logger.info("gem_scan_complete total=%d gems=%d anomalies=%d duration=%.1fs",
                     len(scored), len(gems), len(anomalies), duration)
 
         result = {
-            "tokens":    scored[:30],
+            "tokens":    scored[:50],
             "gems":      gems,
             "anomalies": anomalies[:10],
             "stats": {

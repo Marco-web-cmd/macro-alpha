@@ -2017,6 +2017,230 @@ async def api_scanner_test():
     })
 
 
+# ═══════════════════════════════════════════════════════════════════
+# TWITTER SCANNER
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/twitter/scan")
+async def api_twitter_scan():
+    """Scan les tendances Twitter crypto."""
+    def _do():
+        from modules.twitter_scanner import TwitterScanner
+        scanner = TwitterScanner()
+        if scanner.mode == "unavailable":
+            return {
+                "error":    "Twitter scraping non disponible",
+                "solution": "pip install ntscraper",
+            }
+        return scanner.scan_crypto_trends()
+    result = await asyncio.to_thread(_do)
+    return safe_jsonify(result)
+
+
+@app.get("/api/twitter/account/{username}")
+async def api_twitter_account(username: str):
+    """Analyse les tokens mentionnés par un compte Twitter."""
+    def _do():
+        from modules.twitter_scanner import TwitterScanner
+        scanner = TwitterScanner()
+        return scanner.scan_target_account(username, limit=10)
+    result = await asyncio.to_thread(_do)
+    return safe_jsonify(result)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TRADING BOT (paper par défaut)
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/bot/account")
+async def api_bot_account():
+    """Informations du compte Binance (paper ou live)."""
+    def _do():
+        from modules.trading_bot import TradingBot
+        return TradingBot().get_account_info()
+    result = await asyncio.to_thread(_do)
+    return safe_jsonify(result)
+
+
+@app.get("/api/bot/orders")
+async def api_bot_orders():
+    """Positions ouvertes + PnL mis à jour."""
+    def _do():
+        from modules.trading_bot import TradingBot
+        bot     = TradingBot()
+        updated = bot.update_positions()
+        return {
+            "orders":      updated,
+            "performance": bot.get_performance(),
+            "mode":        "PAPER" if bot.dry_run else "LIVE",
+        }
+    result = await asyncio.to_thread(_do)
+    return safe_jsonify(result)
+
+
+@app.post("/api/bot/buy")
+async def api_bot_buy(request: Request):
+    """Place un ordre d'achat (paper ou live selon DRY_RUN)."""
+    data    = await request.json()
+    symbol  = data.get("symbol", "").upper()
+    amount  = float(data.get("amount_usdt", 100))
+    sl_pct  = float(data.get("sl_pct", 10))
+    tp1_pct = float(data.get("tp1_pct", 15))
+
+    if not symbol:
+        return safe_jsonify({"error": "symbol requis"}, 400)
+
+    def _do():
+        from modules.trading_bot import TradingBot
+        bot   = TradingBot()
+        order = bot.place_order(
+            symbol=symbol, side="buy",
+            amount_usdt=amount,
+            sl_pct=sl_pct, tp1_pct=tp1_pct,
+            strategy=data.get("strategy", "GEM_SWING"),
+        )
+        return {
+            "success": True,
+            "order":   order.__dict__,
+            "mode":    "PAPER" if bot.dry_run else "LIVE",
+        }
+    try:
+        result = await asyncio.to_thread(_do)
+        return safe_jsonify(result)
+    except Exception as exc:
+        return safe_jsonify({"error": str(exc)}, 500)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# WHALE TRACKER
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/whales/{symbol}")
+async def api_whales(symbol: str):
+    """Analyse whale order book + trades pour un token."""
+    from modules.whale_tracker import WhaleTracker
+    tracker = WhaleTracker()
+    ob, tr  = await asyncio.gather(
+        tracker.detect_whale_orders_binance(symbol.upper()),
+        tracker.analyze_recent_trades(symbol.upper(), 500),
+    )
+    await tracker.close()
+    return safe_jsonify({
+        "symbol":         symbol.upper(),
+        "order_book":     ob,
+        "trade_analysis": tr,
+    })
+
+
+@app.get("/api/whales/scan/top")
+async def api_whales_scan():
+    """Scan whale sur les top tokens du scanner."""
+    cache_key = "whale_scan"
+    cached    = _disk_cache.get(cache_key) if DISKCACHE_OK else None
+    if cached and (time.time() - cached.get("ts_epoch", 0)) < 120:
+        return safe_jsonify(cached)
+
+    scanner_data = _disk_cache.get("scanner_latest") if DISKCACHE_OK else {}
+    tokens = [
+        t["symbol"] for t in (scanner_data or {}).get("tokens", [])[:20]
+    ]
+    if not tokens:
+        tokens = ["BTC", "ETH", "SOL", "BNB", "ADA", "DOT",
+                  "AVAX", "MATIC", "LINK", "UNI"]
+
+    from modules.whale_tracker import WhaleTracker
+    tracker = WhaleTracker()
+    results = await tracker.scan_multiple_tokens(tokens)
+    await tracker.close()
+
+    result = {
+        "whales":     results,
+        "top_signal": results[0] if results else None,
+        "ts":         datetime.now(timezone.utc).isoformat(),
+        "ts_epoch":   time.time(),
+    }
+    if DISKCACHE_OK:
+        _disk_cache.set(cache_key, result, expire=120)
+    return safe_jsonify(result)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SIGNAL COMBINÉ : gem + whale + twitter + claude
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/combined/{symbol}")
+async def api_combined_signal(symbol: str):
+    """Signal composite : scanner gem + whale + twitter + Claude narrative."""
+    sym = symbol.upper()
+
+    # Données scanner en cache
+    scan_data = _disk_cache.get("scanner_latest") if DISKCACHE_OK else {}
+    token     = next(
+        (t for t in (scan_data or {}).get("tokens", [])
+         if t["symbol"] == sym),
+        {"symbol": sym, "score": {}},
+    )
+
+    # Whale + twitter en parallèle (async)
+    from modules.whale_tracker import WhaleTracker
+    tracker = WhaleTracker()
+    ob, tr  = await asyncio.gather(
+        tracker.detect_whale_orders_binance(sym),
+        tracker.analyze_recent_trades(sym, 200),
+    )
+    await tracker.close()
+
+    # Twitter (sync dans thread)
+    def _tw():
+        from modules.twitter_scanner import TwitterScanner
+        sc = TwitterScanner()
+        if sc.mode == "unavailable":
+            return {}
+        return sc.scan_target_account(sym, limit=5)
+
+    tw_data = await asyncio.to_thread(_tw)
+
+    # Claude narrative
+    from modules.claude_narrator import analyze_with_claude
+    narrative = await analyze_with_claude(token, tw_data)
+
+    # Score composite
+    gem_sc   = token.get("score", {}).get("total_score", 0)
+    whale_ob = ob.get("buy_pressure", 50)
+    whale_tr = 80 if tr.get("pattern") == "WHALE_ACCUMULATION" else 40
+    narr_sc  = narrative.get("score_narratif", 50)
+    tw_sc    = min(100, tw_data.get("tokens_mentioned", {}).get(sym, 0) * 2)
+
+    final_score = int(
+        gem_sc   * 0.35 +
+        whale_ob * 0.25 +
+        whale_tr * 0.20 +
+        narr_sc  * 0.15 +
+        tw_sc    * 0.05
+    )
+
+    verdict = (
+        "ROCKET GO"      if final_score >= 75 else
+        "SURVEILLER"     if final_score >= 55 else
+        "PASSER"
+    )
+
+    return safe_jsonify({
+        "symbol":        sym,
+        "final_score":   final_score,
+        "verdict":       verdict,
+        "gem_score":     gem_sc,
+        "whale_signal":  ob.get("signal", "?"),
+        "whale_pattern": tr.get("pattern", "?"),
+        "buy_pressure":  whale_ob,
+        "narrative":     narrative,
+        "twitter":       tw_data,
+        "timing":        narrative.get("timing", "?"),
+        "conviction":    narrative.get("conviction", "?"),
+        "ts":            datetime.now(timezone.utc).isoformat(),
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=5001, reload=False, log_level="info")
