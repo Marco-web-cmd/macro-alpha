@@ -2241,6 +2241,101 @@ async def api_combined_signal(symbol: str):
     })
 
 
+# ═══════════════════════════════════════════════════════════════════
+# JUPITER SWAP — DEX Solana
+# ═══════════════════════════════════════════════════════════════════
+
+@app.get("/api/jupiter/price/{symbol}")
+async def api_jupiter_price(symbol: str):
+    """Prix d'un token Solana via Jupiter."""
+    from modules.jupiter_swap import JupiterSwap
+    j = JupiterSwap()
+    return safe_jsonify(await j.get_token_price(symbol))
+
+
+@app.get("/api/jupiter/quote")
+async def api_jupiter_quote(
+    symbol: str = Query(..., description="Token à acheter (ex: SOL, BONK)"),
+    amount: float = Query(100.0, description="Montant USDC à dépenser"),
+    slippage: int = Query(100, description="Slippage en basis points (100 = 1%)"),
+):
+    """Obtient un quote Jupiter sans exécuter le swap."""
+    from modules.jupiter_swap import JupiterSwap, USDC_MINT
+    j    = JupiterSwap()
+    mint = await j.resolve_token_mint(symbol.upper())
+    if not mint:
+        return safe_jsonify({"ok": False, "error": f"{symbol} non trouvé"}, 404)
+    quote = await j.get_quote(
+        input_mint=USDC_MINT,
+        output_mint=mint,
+        amount_usdc=amount,
+        slippage_bps=slippage,
+    )
+    return safe_jsonify({**quote, "symbol": symbol.upper(), "amount_usdc": amount})
+
+
+@app.post("/api/jupiter/buy")
+async def api_jupiter_buy(request: Request):
+    """
+    Swap USDC → token via Jupiter.
+    Paper trading si DRY_RUN=true (défaut).
+    Body JSON : {"symbol": "BONK", "amount_usdc": 50, "slippage_bps": 100}
+    """
+    data        = await request.json()
+    symbol      = data.get("symbol", "").upper()
+    amount_usdc = float(data.get("amount_usdc", 50))
+    slippage    = int(data.get("slippage_bps", 100))
+
+    if not symbol:
+        return safe_jsonify({"error": "symbol requis"}, 400)
+    if amount_usdc < 1:
+        return safe_jsonify({"error": "amount_usdc minimum 1"}, 400)
+
+    from modules.jupiter_swap import JupiterSwap
+    j      = JupiterSwap()
+    result = await j.execute_swap(symbol, amount_usdc, slippage)
+    return safe_jsonify(result)
+
+
+@app.post("/api/jupiter/sell")
+async def api_jupiter_sell(request: Request):
+    """
+    Vend des tokens → USDC via Jupiter.
+    Body JSON : {"symbol": "BONK", "amount_tokens": 1000000, "slippage_bps": 150}
+    """
+    data          = await request.json()
+    symbol        = data.get("symbol", "").upper()
+    amount_tokens = float(data.get("amount_tokens", 0))
+    slippage      = int(data.get("slippage_bps", 150))
+
+    if not symbol or amount_tokens <= 0:
+        return safe_jsonify({"error": "symbol et amount_tokens requis"}, 400)
+
+    from modules.jupiter_swap import JupiterSwap
+    j      = JupiterSwap()
+    result = await j.execute_sell(symbol, amount_tokens, slippage)
+    return safe_jsonify(result)
+
+
+@app.get("/api/jupiter/portfolio")
+async def api_jupiter_portfolio():
+    """Solde du wallet Solana (USDC + tokens)."""
+    from modules.jupiter_swap import JupiterSwap
+    j = JupiterSwap()
+    return safe_jsonify(await j.get_portfolio())
+
+
+@app.get("/api/jupiter/tokens")
+async def api_jupiter_tokens():
+    """Liste des tokens Solana connus + résolution disponible."""
+    from modules.jupiter_swap import KNOWN_TOKENS
+    return safe_jsonify({
+        "known_tokens": KNOWN_TOKENS,
+        "count":        len(KNOWN_TOKENS),
+        "note":         "Tout token Solana listé sur Jupiter est supporté",
+    })
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=5001, reload=False, log_level="info")
