@@ -405,6 +405,7 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
         <button class="chart-tab" onclick="showTab('agent',this)">Agent IA</button>
         <button class="chart-tab" onclick="showTab('history',this)">Historique</button>
         <button class="chart-tab" onclick="showTab('scanner',this);runScan()">Scanner</button>
+        <button class="chart-tab" onclick="showTab('trading',this);loadTrading()">Trading</button>
       </div>
 
       <div id="tab-content">
@@ -593,6 +594,87 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
           <!-- Ancienne liste (cachée, pour compatibilité) -->
           <div id="scanner-loading" style="display:none"></div>
           <div id="scanner-list" style="display:none"></div>
+        </div>
+
+        <!-- TAB TRADING -->
+        <div id="tab-trading" class="subpanel" style="padding:10px 14px;display:none">
+
+          <!-- Wallet / Portfolio -->
+          <div style="background:var(--bg3);border-radius:4px;padding:8px 10px;margin-bottom:8px">
+            <div style="font-size:7px;color:var(--text3);letter-spacing:1px;margin-bottom:4px">WALLET SOLANA</div>
+            <div id="tr-wallet" style="font-size:7px;color:var(--text3);margin-bottom:4px;word-break:break-all">—</div>
+            <div id="tr-balance" style="font-size:11px;font-weight:700;color:var(--accent)">— USDC</div>
+            <div id="tr-mode" style="font-size:7px;margin-top:2px"></div>
+          </div>
+
+          <!-- Achat rapide -->
+          <div style="font-size:7px;color:var(--purple,#9c6fdf);letter-spacing:1px;margin-bottom:6px;font-weight:700">⚡ SWAP DEX (Jupiter)</div>
+
+          <div style="display:flex;gap:4px;margin-bottom:4px">
+            <input id="tr-symbol" type="text" placeholder="SOL, BONK, WIF…"
+              style="flex:1;background:var(--bg3);border:1px solid var(--border2,#2a2b3d);border-radius:4px;padding:5px 7px;color:var(--text1);font-size:8px;font-family:var(--mono,'monospace')"/>
+            <input id="tr-amount" type="number" value="50" min="1"
+              style="width:60px;background:var(--bg3);border:1px solid var(--border2,#2a2b3d);border-radius:4px;padding:5px 7px;color:var(--text1);font-size:8px;font-family:var(--mono,'monospace')"/>
+            <div style="font-size:7px;color:var(--text3);align-self:center">USDC</div>
+          </div>
+
+          <!-- Quote + Slippage -->
+          <div style="display:flex;gap:4px;margin-bottom:6px;align-items:center">
+            <div style="font-size:7px;color:var(--text3)">Slippage</div>
+            <select id="tr-slippage"
+              style="background:var(--bg3);border:1px solid var(--border2,#2a2b3d);border-radius:4px;padding:3px;color:var(--text1);font-size:8px">
+              <option value="50">0.5%</option>
+              <option value="100" selected>1%</option>
+              <option value="200">2%</option>
+              <option value="300">3%</option>
+            </select>
+            <button onclick="getQuote()"
+              style="flex:1;padding:4px;border-radius:4px;border:1px solid var(--border2);background:transparent;color:var(--text2);cursor:pointer;font-size:7px;font-family:var(--mono)">
+              Simuler
+            </button>
+          </div>
+
+          <!-- Quote result -->
+          <div id="tr-quote" style="background:var(--bg3);border-radius:4px;padding:6px 8px;margin-bottom:6px;font-size:8px;display:none">
+            <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+              <span style="color:var(--text3)">Tu recevras</span>
+              <span id="tr-q-out" style="font-weight:700;color:var(--accent)">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between;margin-bottom:2px">
+              <span style="color:var(--text3)">Prix effectif</span>
+              <span id="tr-q-price">—</span>
+            </div>
+            <div style="display:flex;justify-content:space-between">
+              <span style="color:var(--text3)">Impact prix</span>
+              <span id="tr-q-impact">—</span>
+            </div>
+          </div>
+
+          <!-- Boutons Acheter / Vendre -->
+          <div style="display:flex;gap:4px;margin-bottom:10px">
+            <button onclick="executeBuy()"
+              style="flex:1;padding:6px;border-radius:4px;border:1px solid var(--bull,#26a69a);background:rgba(38,166,154,0.12);color:var(--bull,#26a69a);cursor:pointer;font-size:8px;font-weight:700;font-family:var(--mono,'monospace')">
+              ▲ ACHETER
+            </button>
+            <button onclick="showSellModal()"
+              style="flex:1;padding:6px;border-radius:4px;border:1px solid var(--bear,#ef5350);background:rgba(239,83,80,0.12);color:var(--bear,#ef5350);cursor:pointer;font-size:8px;font-weight:700;font-family:var(--mono,'monospace')">
+              ▼ VENDRE
+            </button>
+          </div>
+
+          <!-- Résultat trade -->
+          <div id="tr-result" style="display:none;background:var(--bg3);border-radius:4px;padding:8px;margin-bottom:8px;font-size:8px"></div>
+
+          <!-- Positions ouvertes -->
+          <div style="font-size:7px;color:var(--neut,#ffab00);letter-spacing:1px;margin-bottom:4px;font-weight:700">📊 POSITIONS</div>
+          <div id="tr-positions">
+            <div style="font-size:8px;color:var(--text3)">—</div>
+          </div>
+
+          <!-- Performance -->
+          <div style="font-size:7px;color:var(--text3);letter-spacing:1px;margin:8px 0 4px;font-weight:700">PERFORMANCE</div>
+          <div id="tr-perf" style="font-size:8px;color:var(--text3)">—</div>
+
         </div>
 
       </div>
@@ -1585,6 +1667,149 @@ async function testConnections() {
 
 // Charge Fear & Greed au démarrage
 loadFearGreed();
+
+// ══ TRADING TAB ══════════════════════════════════════════════════
+
+async function loadTrading() {
+  try {
+    // Portfolio Jupiter
+    const p = await fetch('/api/jupiter/portfolio').then(r => r.json());
+    document.getElementById('tr-wallet').textContent =
+      p.wallet ? p.wallet.slice(0,8) + '...' + p.wallet.slice(-6) : 'Non configuré';
+    const bal = p.balance || {};
+    const usdc = bal['USDC'] || bal['EPjFWdd'] || 0;
+    const sol  = bal['SOL'] || 0;
+    document.getElementById('tr-balance').textContent =
+      `${usdc.toFixed(2)} USDC  •  ${sol.toFixed(4)} SOL`;
+    const modeEl = document.getElementById('tr-mode');
+    modeEl.textContent = p.mode === 'PAPER' ? '📋 PAPER TRADING (DRY_RUN=true)' : '🔴 LIVE';
+    modeEl.style.color = p.mode === 'PAPER' ? 'var(--text3)' : 'var(--bear,#ef5350)';
+
+    // Positions bot
+    const bot = await fetch('/api/bot/orders').then(r => r.json());
+    renderPositions(bot.orders || []);
+    renderPerf(bot.performance || {});
+  } catch(e) {
+    document.getElementById('tr-balance').textContent = 'Erreur chargement';
+  }
+}
+
+async function getQuote() {
+  const sym    = document.getElementById('tr-symbol').value.trim().toUpperCase();
+  const amount = parseFloat(document.getElementById('tr-amount').value) || 50;
+  const slip   = parseInt(document.getElementById('tr-slippage').value) || 100;
+  if (!sym) { alert('Entre un symbole (ex: SOL)'); return; }
+
+  const r = await fetch(`/api/jupiter/quote?symbol=${sym}&amount=${amount}&slippage=${slip}`).then(r=>r.json());
+  const el = document.getElementById('tr-quote');
+  el.style.display = 'block';
+  if (r.ok) {
+    document.getElementById('tr-q-out').textContent    = `${r.out_human} ${sym}`;
+    document.getElementById('tr-q-price').textContent  = `$${r.price}`;
+    const imp = r.price_impact || 0;
+    const impEl = document.getElementById('tr-q-impact');
+    impEl.textContent = `${imp.toFixed(3)}%`;
+    impEl.style.color = imp > 2 ? 'var(--bear,#ef5350)' : 'var(--bull,#26a69a)';
+  } else {
+    el.innerHTML = `<span style="color:var(--bear)">${r.error || 'Erreur'}</span>`;
+  }
+}
+
+async function executeBuy() {
+  const sym    = document.getElementById('tr-symbol').value.trim().toUpperCase();
+  const amount = parseFloat(document.getElementById('tr-amount').value) || 50;
+  const slip   = parseInt(document.getElementById('tr-slippage').value) || 100;
+  if (!sym) { alert('Entre un symbole'); return; }
+
+  const resEl = document.getElementById('tr-result');
+  resEl.style.display = 'block';
+  resEl.innerHTML = '<span style="color:var(--text3)">⏳ Envoi en cours…</span>';
+
+  const r = await fetch('/api/jupiter/buy', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({symbol: sym, amount_usdc: amount, slippage_bps: slip})
+  }).then(r => r.json());
+
+  if (r.ok) {
+    const live = r.mode === 'LIVE';
+    resEl.innerHTML = `
+      <div style="color:var(--bull,#26a69a);font-weight:700;margin-bottom:4px">
+        ${live ? '✅ ORDRE EXÉCUTÉ' : '📋 SIMULÉ (PAPER)'}
+      </div>
+      <div>Acheté : <b>${r.out_amount} ${sym}</b> pour <b>${r.amount_usdc} USDC</b></div>
+      <div>Prix : $${r.price}</div>
+      ${r.tx_hash ? `<div style="color:var(--accent)">TX : <a href="${r.explorer || '#'}" target="_blank" style="color:var(--accent)">${r.tx_hash.slice(0,20)}…</a></div>` : ''}
+      ${r.note ? `<div style="color:var(--text3);margin-top:2px">${r.note}</div>` : ''}
+    `;
+  } else {
+    resEl.innerHTML = `<span style="color:var(--bear,#ef5350)">❌ ${r.error || 'Erreur'}</span>`;
+  }
+  loadTrading();
+}
+
+function showSellModal() {
+  const sym = prompt('Symbole à vendre (ex: BONK):');
+  if (!sym) return;
+  const qty = prompt(`Quantité de ${sym.toUpperCase()} à vendre:`);
+  if (!qty) return;
+  executeSell(sym.toUpperCase(), parseFloat(qty));
+}
+
+async function executeSell(sym, qty) {
+  const slip  = parseInt(document.getElementById('tr-slippage').value) || 150;
+  const resEl = document.getElementById('tr-result');
+  resEl.style.display = 'block';
+  resEl.innerHTML = '<span style="color:var(--text3)">⏳ Vente en cours…</span>';
+
+  const r = await fetch('/api/jupiter/sell', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({symbol: sym, amount_tokens: qty, slippage_bps: slip})
+  }).then(r => r.json());
+
+  if (r.ok) {
+    resEl.innerHTML = `
+      <div style="color:var(--bear,#ef5350);font-weight:700;margin-bottom:4px">
+        ${r.mode === 'LIVE' ? '✅ VENDU' : '📋 VENTE SIMULÉE'}
+      </div>
+      <div>Vendu : <b>${qty} ${sym}</b> → <b>${r.usdc_out} USDC</b></div>
+      ${r.tx_hash ? `<div style="color:var(--accent)">TX : ${r.tx_hash.slice(0,20)}…</div>` : ''}
+    `;
+  } else {
+    resEl.innerHTML = `<span style="color:var(--bear)">❌ ${r.error}</span>`;
+  }
+  loadTrading();
+}
+
+function renderPositions(orders) {
+  const el = document.getElementById('tr-positions');
+  const open = orders.filter(o => ['filled','filled_simulated'].includes(o.status));
+  if (!open.length) { el.innerHTML = '<div style="font-size:8px;color:var(--text3)">Aucune position</div>'; return; }
+  el.innerHTML = open.map(o => {
+    const pnl    = o.pnl_pct || 0;
+    const color  = pnl >= 0 ? 'var(--bull,#26a69a)' : 'var(--bear,#ef5350)';
+    const paper  = o.dry_run ? ' 📋' : '';
+    return `<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border);font-size:8px">
+      <span><b>${o.symbol}</b>${paper} <span style="color:var(--text3);font-size:7px">${o.strategy||'?'}</span></span>
+      <span>$${o.price?.toFixed(4)||'?'}</span>
+      <span style="color:${color}">${pnl >= 0 ? '+' : ''}${pnl.toFixed(1)}%</span>
+    </div>`;
+  }).join('');
+}
+
+function renderPerf(perf) {
+  const el = document.getElementById('tr-perf');
+  if (perf.message) { el.textContent = perf.message; return; }
+  el.innerHTML = `
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <span>Trades : <b>${perf.total_trades||0}</b></span>
+      <span>Win rate : <b style="color:var(--bull)">${perf.win_rate||0}%</b></span>
+      <span>PnL : <b style="color:${(perf.total_pnl_usd||0)>=0?'var(--bull)':'var(--bear)'}">${(perf.total_pnl_usd||0)>=0?'+':''}$${perf.total_pnl_usd||0}</b></span>
+      <span style="color:var(--text3)">${perf.mode||''}</span>
+    </div>
+  `;
+}
 </script>
 </body>
 </html>

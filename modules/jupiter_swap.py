@@ -87,12 +87,18 @@ class JupiterSwap:
             return None
 
     def _init_rpc(self):
-        """Initialise le client RPC Solana (Helius)."""
-        if not self.rpc_url or "api-key=" not in self.rpc_url and "helius" not in self.rpc_url:
+        """Initialise le client RPC Solana (Helius ou URL custom)."""
+        helius_key = os.getenv("HELIUS_API_KEY", "")
+        url = self.rpc_url or (
+            f"https://mainnet.helius-rpc.com/?api-key={helius_key}"
+            if helius_key else ""
+        )
+        if not url:
+            log.warning("solana_rpc_no_url")
             return None
         try:
             from solana.rpc.api import Client
-            client = Client(self.rpc_url)
+            client = Client(url)
             return client
         except Exception as e:
             log.error("rpc_init_failed", error=str(e))
