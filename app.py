@@ -49,7 +49,7 @@ except ImportError:
     SCHEDULER_OK = False
 
 from fastapi import FastAPI, Query, Request, BackgroundTasks, WebSocket, WebSocketDisconnect
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.templating import Jinja2Templates
 import websockets as _ws_lib
 
@@ -2402,6 +2402,37 @@ async def api_bot_close(position_id: str):
     bot    = _get_solana_bot()
     result = await bot.manual_close(position_id)
     return safe_jsonify(result)
+
+
+@app.get("/api/solana-bot/live")
+async def api_bot_live():
+    """
+    SSE — pousse le statut du bot toutes les 3 secondes.
+    Le dashboard s'y connecte une fois et reçoit les updates en continu.
+    """
+    bot = _get_solana_bot()
+
+    async def event_stream():
+        import json as _json
+        while True:
+            try:
+                status = bot.get_status()
+                data   = _json.dumps(_sanitize(status), cls=SafeEncoder)
+                yield f"data: {data}\n\n"
+            except Exception as e:
+                yield f"data: {{}}\n\n"
+                logger.warning("sse_bot_error: %s", e)
+            await asyncio.sleep(3)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":               "no-cache",
+            "X-Accel-Buffering":           "no",
+            "Access-Control-Allow-Origin": "*",
+        },
+    )
 
 
 if __name__ == "__main__":

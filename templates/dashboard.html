@@ -2300,84 +2300,110 @@ function showPage(page, btn) {
     // Afficher/masquer les contrôles chart
     document.getElementById('chart-controls').style.display = page === 'chart' ? 'flex' : 'none';
     // Actions spécifiques au changement de page
-    if (page === 'bot')   loadBotStatus();
+    if (page === 'bot') {
+        loadBotStatus();   // charge + démarre SSE
+    } else {
+        _stopBotSSE();     // coupe le SSE quand on quitte l'onglet bot
+    }
     if (page === 'agent') { loadAgentPage(); loadFearGreed(); }
 }
 
 // ══ BOT SOLANA ════════════════════════════════════════════════
-let _botRunning = false;
-let _botRefreshTimer = null;
-
+let _botRunning  = false;
 let _botCurrency = 'SOL';
+let _botSSE      = null;   // EventSource SSE
+
+function _applyBotData(d) {
+    if (!d || !d.base_currency) return;
+    _botRunning  = d.running;
+    _botCurrency = d.base_currency || 'SOL';
+    const cur    = _botCurrency;
+
+    // Dot + texte
+    const dot = document.getElementById('bot-dot');
+    const txt = document.getElementById('bot-status-txt');
+    if (dot) dot.classList.toggle('running', _botRunning);
+    if (txt) txt.textContent = _botRunning
+        ? `Bot actif — ${(+d.available_usdc).toFixed(4)} ${cur} dispo / ${(+d.total_capital).toFixed(4)} ${cur} total`
+        : 'Inactif';
+
+    // Bouton
+    const btn = document.getElementById('btn-toggle-bot');
+    if (btn) {
+        btn.textContent   = _botRunning ? '⏹ Arrêter' : '▶ Démarrer';
+        btn.className     = _botRunning ? 'btn btn-sell' : 'btn btn-buy';
+        btn.style.cssText = 'padding:4px 14px;font-size:9px;font-weight:700';
+    }
+    // Mode badge
+    const mb = document.getElementById('bot-mode-badge');
+    if (mb) {
+        mb.textContent = d.mode;
+        mb.style.color = d.mode === 'LIVE' ? 'var(--bear)' : 'var(--accent)';
+    }
+    // Stats header
+    setEl('bot-pos-count', d.open_positions ?? 0);
+    setEl('bot-winrate', (d.win_rate ?? 0) + '%');
+    const pnl   = d.realized_pnl ?? d.total_pnl_usdc ?? 0;
+    const pnlEl = document.getElementById('bot-total-pnl');
+    if (pnlEl) {
+        pnlEl.textContent = (pnl >= 0 ? '+' : '') + (+pnl).toFixed(4) + ' ' + cur;
+        pnlEl.style.color = pnl >= 0 ? 'var(--bull)' : 'var(--bear)';
+    }
+    // Stats panel
+    setEl('bs-trades', d.total_trades ?? 0);
+    setEl('bs-wr', (d.win_rate ?? 0) + '%');
+    const bsPnlEl = document.getElementById('bs-pnl');
+    if (bsPnlEl) {
+        bsPnlEl.textContent = (pnl >= 0 ? '+' : '') + (+pnl).toFixed(4) + ' ' + cur;
+        bsPnlEl.style.color = pnl >= 0 ? 'var(--bull)' : 'var(--bear)';
+    }
+    setEl('bs-open', (d.open_positions ?? 0) + '/' + (d.max_positions ?? 6));
+    setEl('bs-mode', d.mode ?? 'PAPER');
+    setEl('bs-capital', (+d.total_capital ?? 0).toFixed(4) + ' ' + cur);
+
+    // Positions
+    renderBotPositions(d.positions || [], cur);
+
+    // Agent context badge
+    const agentCtx = d.agent_context || {};
+    const agentEl  = document.getElementById('bot-agent-badge');
+    if (agentEl) {
+        const sm    = agentCtx.size_mult ?? 1;
+        const phase = agentCtx.cycle_phase || '–';
+        const macro = agentCtx.macro_score != null ? (+agentCtx.macro_score).toFixed(0) : '–';
+        const color = sm === 0 ? 'var(--bear)' : sm >= 0.8 ? 'var(--bull)' : '#f5a623';
+        const label = sm === 0 ? '🛑 BLOQUÉ' : sm < 1 ? `⚠ x${sm}` : '✅ OK';
+        agentEl.innerHTML = `<span style="color:${color};font-weight:700">${label}</span> Macro <b>${macro}</b> | ${phase} | ${agentCtx.market_regime || '–'}`;
+    }
+
+    // Log (uniquement si différent du dernier rendu)
+    renderBotLog(d.log || []);
+}
+
+function _startBotSSE() {
+    if (_botSSE) { _botSSE.close(); _botSSE = null; }
+    _botSSE = new EventSource('/api/solana-bot/live');
+    _botSSE.onmessage = (e) => {
+        try { _applyBotData(JSON.parse(e.data)); } catch(_) {}
+    };
+    _botSSE.onerror = () => {
+        // Reconnexion automatique après 5s si la connexion SSE chute
+        _botSSE.close();
+        _botSSE = null;
+        setTimeout(_startBotSSE, 5000);
+    };
+}
+
+function _stopBotSSE() {
+    if (_botSSE) { _botSSE.close(); _botSSE = null; }
+}
 
 async function loadBotStatus() {
     try {
         const d = await fetch('/api/solana-bot/status').then(r => r.json());
-        _botRunning = d.running;
-        _botCurrency = d.base_currency || 'SOL';
-        const cur = _botCurrency;
-
-        // Dot + texte
-        const dot = document.getElementById('bot-dot');
-        const txt = document.getElementById('bot-status-txt');
-        if (dot) { dot.classList.toggle('running', _botRunning); }
-        if (txt)  txt.textContent = _botRunning
-            ? `Bot actif — ${d.available_usdc} ${cur} dispo / ${d.total_capital} ${cur} total`
-            : 'Inactif';
-
-        // Bouton
-        const btn = document.getElementById('btn-toggle-bot');
-        if (btn) {
-            btn.textContent  = _botRunning ? '⏹ Arrêter' : '▶ Démarrer';
-            btn.className    = _botRunning ? 'btn btn-sell' : 'btn btn-buy';
-            btn.style.cssText = 'padding:4px 14px;font-size:9px;font-weight:700';
-        }
-        // Mode badge
-        const mb = document.getElementById('bot-mode-badge');
-        if (mb) {
-            mb.textContent = d.mode;
-            mb.style.color = d.mode === 'LIVE' ? 'var(--bear)' : 'var(--accent)';
-        }
-        // Stats header
-        setEl('bot-pos-count', d.open_positions ?? 0);
-        setEl('bot-winrate', (d.win_rate ?? 0) + '%');
-        const pnl = d.realized_pnl ?? d.total_pnl_usdc ?? 0;
-        const pnlEl = document.getElementById('bot-total-pnl');
-        if (pnlEl) {
-            pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' ' + cur;
-            pnlEl.style.color = pnl >= 0 ? 'var(--bull)' : 'var(--bear)';
-        }
-        // Stats panel
-        setEl('bs-trades', d.total_trades ?? 0);
-        setEl('bs-wr', (d.win_rate ?? 0) + '%');
-        const bsPnlEl = document.getElementById('bs-pnl');
-        if (bsPnlEl) {
-            bsPnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' ' + cur;
-            bsPnlEl.style.color = pnl >= 0 ? 'var(--bull)' : 'var(--bear)';
-        }
-        setEl('bs-open', (d.open_positions ?? 0) + '/' + (d.max_positions ?? 6));
-        setEl('bs-mode', d.mode ?? 'PAPER');
-        // Capital
-        setEl('bs-capital', (d.total_capital ?? 0) + ' ' + cur);
-        // Positions
-        renderBotPositions(d.positions || [], cur);
-        // Agent context badge
-        const agentCtx = d.agent_context || {};
-        const agentEl = document.getElementById('bot-agent-badge');
-        if (agentEl) {
-            const sm = agentCtx.size_mult ?? 1;
-            const phase = agentCtx.cycle_phase || '–';
-            const macro = agentCtx.macro_score != null ? agentCtx.macro_score.toFixed(0) : '–';
-            const regime = agentCtx.market_regime || '–';
-            const color = sm === 0 ? 'var(--bear)' : sm >= 0.8 ? 'var(--bull)' : '#f5a623';
-            const gateLabel = sm === 0 ? '🛑 BLOQUÉ' : sm < 1 ? `⚠ x${sm}` : '✅ OK';
-            agentEl.innerHTML = `<span style="color:${color};font-weight:700">${gateLabel}</span> Macro <b>${macro}</b> | ${phase} | ${regime}`;
-        }
-        // Log
-        renderBotLog(d.log || []);
-        // Auto-refresh si bot actif
-        clearInterval(_botRefreshTimer);
-        if (_botRunning) _botRefreshTimer = setInterval(loadBotStatus, 15000);
+        _applyBotData(d);
+        // Lance (ou relance) le SSE pour les updates suivantes
+        if (!_botSSE) _startBotSSE();
     } catch(e) {
         toast('Erreur chargement bot: ' + e.message, 'err');
     }

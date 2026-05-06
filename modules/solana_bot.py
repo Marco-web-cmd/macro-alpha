@@ -578,17 +578,20 @@ class SolanaBot:
         if not open_pos:
             return
 
-        # Fetch tous les prix en parallèle
+        # Fetch les prix avec concurrence limitée à 2 (évite le rate-limit DexScreener)
         mints = [
             (pos, pos.get("mint") or KNOWN_MINTS.get(pos["symbol"], ""))
             for pos in open_pos
         ]
+        _sem = asyncio.Semaphore(2)
 
         async def fetch_one(pos, mint):
-            p = await self._fetch_price_dex(mint) if mint else None
-            if not p:
-                p = await self._fetch_price_birdeye(mint) if mint else None
-            return pos, p
+            async with _sem:
+                p = await self._fetch_price_dex(mint) if mint else None
+                if not p:
+                    await asyncio.sleep(0.5)
+                    p = await self._fetch_price_birdeye(mint) if mint else None
+                return pos, p
 
         results = await asyncio.gather(
             *[fetch_one(pos, mint) for pos, mint in mints],
