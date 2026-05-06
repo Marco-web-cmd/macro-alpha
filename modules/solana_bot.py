@@ -132,14 +132,13 @@ class SolanaBot:
         await self._get_session()   # crée la session une seule fois
         self._scan_task   = asyncio.create_task(self._scan_loop())
         self._mon_task    = asyncio.create_task(self._monitor_loop())
-        # Stream WebSocket désactivé — parsing trop bruité, flood event loop
-        # self._stream_task = asyncio.create_task(self._start_stream())
+        self._stream_task = asyncio.create_task(self._start_stream())
         cap  = self._total_capital()
         mode = "PAPER" if self.dry_run else "LIVE"
         self._log("BOT_START",
             f"Mode {mode} — capital {INITIAL_CAPITAL} {BASE_CURRENCY} "
             f"| total {cap} {BASE_CURRENCY}")
-        return {"ok": True, "msg": "Bot démarré — scan + stream WebSocket actifs"}
+        return {"ok": True, "msg": "Bot démarré — scan + monitor + stream WebSocket actifs"}
 
     async def stop(self) -> dict:
         self.running = False
@@ -202,6 +201,133 @@ class SolanaBot:
             except Exception as e:
                 log.error("monitor_error", error=str(e))
             await asyncio.sleep(MONITOR_INTERVAL)
+
+    # ── Stream WebSocket push ─────────────────────────────────
+
+    async def _start_stream(self):
+        """Lance le WebSocket stream Raydium/Pump.fun en tâche de fond."""
+        try:
+            from modules.token_stream import TokenStream
+            self._stream = TokenStream()
+            await self._stream.start(self._on_stream_token)
+            log.info("stream_task_started")
+        except Exception as e:
+            log.warning("stream_start_failed", error=str(e))
+
+    async def _on_stream_token(self, event: dict):
+        """
+        Callback appelé pour chaque nouveau token détecté via WebSocket.
+        Évalue le token via DexScreener : si score ≥ MIN_SCORE et slot dispo → entrée.
+        Rate-limité par TokenStream (max 5/sec) donc pas besoin de guard ici.
+        """
+        if not self.running:
+            return
+
+        mint   = event.get("mint", "")
+        source = event.get("source", "unknown")
+        sig    = event.get("signature", "")[:8]
+
+        now = asyncio.get_event_loop().time()
+
+        # Throttle DexScreener : 1 lookup/2s max pour éviter le rate-limit
+        last_lookup = getattr(self, "_last_stream_lookup", 0)
+        if now - last_lookup < 2:
+            return
+        self._last_stream_lookup = now
+
+        # Cooldown trade : pas plus de 1 entrée rapide toutes les 10s
+        last_trade = getattr(self, "_last_stream_trade", 0)
+        if now - last_trade < 10:
+            return
+
+        positions = self._load_positions()
+        open_pos  = [p for p in positions if p["status"] == "open"]
+        slots     = MAX_POSITIONS - len(open_pos)
+        if slots <= 0:
+            return
+
+        ctx       = self._agent_context()
+        size_mult = ctx["size_mult"]
+        if size_mult == 0.0:
+            return
+
+        total_cap = self._total_capital()
+        available = total_cap - self._invested_capital()
+        if available < MIN_POSITION:
+            return
+
+        # Récupère les données du token via DexScreener
+        token_data = await self._dexscreener_token_data(mint)
+        if not token_data:
+            return
+
+        sym = token_data.get("symbol", mint[:8]).upper()
+        if sym in {p["symbol"] for p in open_pos}:
+            return
+
+        liq = float(token_data.get("liquidity") or 0)
+        mc  = float(token_data.get("mc") or 0)
+        if liq < MIN_LIQ_USD:
+            return
+        if mc > 0 and liq / mc < MIN_LIQ_MC_RATIO:
+            return
+
+        score = self._score(token_data)
+        if score < MIN_SCORE:
+            log.info("stream_token_rejected", sym=sym, score=score,
+                     source=source, sig=sig)
+            return
+
+        price = float(token_data.get("price") or 0)
+        if not price:
+            return
+
+        pf = await self._preflight_check(mint, sym)
+        if not pf["ok"]:
+            return
+
+        amount = self._position_size(score, available, slots, total_cap)
+        amount = round(amount * size_mult, 4)
+        if amount < MIN_POSITION:
+            return
+
+        self._last_stream_trade = now  # type: ignore[attr-defined]
+        self._log("STREAM",
+            f"⚡ [{source.upper()}] {sym} détecté — score {score:.0f} — entrée {amount:.4f} SOL",
+            sym)
+        await self._open_position(sym, token_data, price, amount, score, ctx)
+
+    async def _dexscreener_token_data(self, mint: str) -> Optional[dict]:
+        """Récupère les données complètes d'un token depuis DexScreener."""
+        try:
+            s = await self._get_session()
+            async with s.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            ) as r:
+                d = await r.json()
+            pairs = sorted(
+                [p for p in d.get("pairs", [])
+                 if p.get("chainId") == "solana"
+                 and float((p.get("liquidity") or {}).get("usd") or 0) > 5_000],
+                key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+                reverse=True,
+            )
+            if not pairs:
+                return None
+            p = pairs[0]
+            base = p.get("baseToken", {})
+            return {
+                "symbol":                (base.get("symbol") or mint[:8]).upper(),
+                "address":               base.get("address") or mint,
+                "price":                 float(p.get("priceUsd") or 0),
+                "priceChange24hPercent": float((p.get("priceChange") or {}).get("h24") or 0),
+                "v24hUSD":               float((p.get("volume") or {}).get("h24") or 0),
+                "mc":                    float(p.get("marketCap") or 0),
+                "liquidity":             float((p.get("liquidity") or {}).get("usd") or 0),
+            }
+        except Exception as e:
+            log.warning("dexscreener_token_data_failed", mint=mint[:8], error=str(e))
+        return None
 
     # ── Signal agent IA ───────────────────────────────────────
 
