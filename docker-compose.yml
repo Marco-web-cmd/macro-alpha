@@ -1,0 +1,104 @@
+version: "3.9"
+
+services:
+
+  api:
+    build: .
+    container_name: macro_alpha_api
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./data:/app/data
+      - ./templates:/app/templates
+      - ./.env:/app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build: .
+    container_name: macro_alpha_worker
+    command: >
+      celery -A tasks worker
+      --loglevel=info
+      --concurrency=1
+      --prefetch-multiplier=1
+      --queues=inference,screener
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER=redis://redis:6379/0
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  beat:
+    build: .
+    container_name: macro_alpha_beat
+    command: >
+      celery -A tasks beat
+      --loglevel=info
+      --scheduler celery.beat:PersistentScheduler
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: macro_alpha_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: macro_alpha_ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    restart: unless-stopped
+    profiles:
+      - llm
+
+  flower:
+    build: .
+    container_name: macro_alpha_flower
+    command: celery -A tasks flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+    depends_on:
+      - redis
+    profiles:
+      - monitoring
+
+volumes:
+  redis_data:
+  ollama_models:

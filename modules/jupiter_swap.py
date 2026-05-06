@@ -48,6 +48,12 @@ KNOWN_TOKENS: dict[str, str] = {
 }
 
 USDC_MINT = KNOWN_TOKENS["USDC"]
+SOL_MINT  = KNOWN_TOKENS["SOL"]
+
+# Token de base pour les swaps (SOL ou USDC selon .env)
+BASE_CURRENCY = os.getenv("BASE_CURRENCY", "SOL").upper()
+BASE_MINT     = SOL_MINT if BASE_CURRENCY == "SOL" else USDC_MINT
+BASE_DECIMALS = 9 if BASE_CURRENCY == "SOL" else 6
 
 
 class JupiterSwap:
@@ -135,14 +141,14 @@ class JupiterSwap:
                         input_mint: str,
                         output_mint: str,
                         amount_usdc: float,
-                        slippage_bps: int = 100) -> dict:
+                        slippage_bps: int = 100,
+                        input_decimals: int = None) -> dict:
         """
         Obtient le meilleur prix Jupiter pour un swap.
-        amount_usdc : montant en USDC (ex: 100.0)
-        slippage_bps : slippage max en basis points (100 = 1%)
+        amount_usdc : montant dans la monnaie d'entrée
         """
-        # USDC a 6 décimales
-        amount_raw = int(amount_usdc * 1_000_000)
+        decimals   = input_decimals if input_decimals is not None else BASE_DECIMALS
+        amount_raw = int(amount_usdc * (10 ** decimals))
 
         try:
             async with httpx.AsyncClient(timeout=10) as client:
@@ -159,7 +165,7 @@ class JupiterSwap:
                 r.raise_for_status()
                 data = r.json()
 
-            in_amount    = int(data["inAmount"]) / 1_000_000   # USDC (6 décimales)
+            in_amount    = int(data["inAmount"]) / (10 ** decimals)
             out_amount   = int(data["outAmount"])
             price_impact = float(data.get("priceImpactPct", 0))
             if price_impact > 1:  # si déjà en pourcentage (v1)
@@ -192,25 +198,24 @@ class JupiterSwap:
     async def execute_swap(self,
                            symbol: str,
                            amount_usdc: float,
-                           slippage_bps: int = 100) -> dict:
+                           slippage_bps: int = 100,
+                           output_mint: str = None,
+                           priority_fee_lamports: int = 50_000) -> dict:
         """
-        Exécute un swap USDC → token via Jupiter.
-        En paper trading : simule sans envoyer la tx.
-
-        symbol      : symbole du token (ex: "SOL", "BONK")
-        amount_usdc : montant en USDC à dépenser
-        slippage_bps: slippage max (100 = 1%, 300 = 3%)
+        Exécute un swap BASE_CURRENCY → token via Jupiter.
+        output_mint : mint address direct (évite la résolution par symbole)
         """
         sym = symbol.upper()
 
-        # Résout le mint
-        output_mint = await self.resolve_token_mint(sym)
+        # Utilise le mint fourni directement, sinon résout par symbole
+        if not output_mint:
+            output_mint = await self.resolve_token_mint(sym)
         if not output_mint:
             return {"ok": False, "error": f"Token {sym} non trouvé sur Solana"}
 
-        # Obtient le quote
+        # Obtient le quote (SOL ou USDC selon BASE_CURRENCY)
         quote = await self.get_quote(
-            input_mint=USDC_MINT,
+            input_mint=BASE_MINT,
             output_mint=output_mint,
             amount_usdc=amount_usdc,
             slippage_bps=slippage_bps,
@@ -268,11 +273,12 @@ class JupiterSwap:
                 r = await client.post(
                     JUPITER_SWAP_URL,
                     json={
-                        "quoteResponse":         quote["raw"],
-                        "userPublicKey":         str(self._keypair.pubkey()),
-                        "wrapAndUnwrapSol":      True,
-                        "dynamicComputeUnitLimit": True,
-                        "prioritizationFeeLamports": 1000,
+                        "quoteResponse":              quote["raw"],
+                        "userPublicKey":              str(self._keypair.pubkey()),
+                        "wrapAndUnwrapSol":           True,
+                        "dynamicComputeUnitLimit":    True,
+                        "prioritizationFeeLamports":  priority_fee_lamports,
+                        "useSharedAccounts":          True,
                     },
                     headers={"Content-Type": "application/json"},
                 )
@@ -363,11 +369,12 @@ class JupiterSwap:
                 r = await client.post(
                     JUPITER_SWAP_URL,
                     json={
-                        "quoteResponse":         quote_raw,
-                        "userPublicKey":         str(self._keypair.pubkey()),
-                        "wrapAndUnwrapSol":      True,
-                        "dynamicComputeUnitLimit": True,
-                        "prioritizationFeeLamports": 1000,
+                        "quoteResponse":             quote_raw,
+                        "userPublicKey":             str(self._keypair.pubkey()),
+                        "wrapAndUnwrapSol":          True,
+                        "dynamicComputeUnitLimit":   True,
+                        "prioritizationFeeLamports": priority_fee_lamports,
+                        "useSharedAccounts":         True,
                     },
                     headers={"Content-Type": "application/json"},
                 )

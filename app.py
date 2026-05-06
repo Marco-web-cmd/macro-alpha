@@ -240,6 +240,14 @@ async def lifespan(app_: FastAPI):
         _scheduler.start()
         logger.info("[Scheduler] APScheduler démarré")
 
+    # ── Solana Bot (auto-démarrage) ──
+    try:
+        bot = _get_solana_bot()
+        await bot.start()
+        logger.info("[SolanaBot] Démarré automatiquement au lancement")
+    except Exception as _be:
+        logger.warning("[SolanaBot] Échec auto-start: %s", _be)
+
     logger.info("=" * 65)
     logger.info("  macro_alpha v4 — FastAPI + WebSocket + DuckDB")
     logger.info("  diskcache : %s", "OK" if DISKCACHE_OK else "désactivé")
@@ -254,6 +262,10 @@ async def lifespan(app_: FastAPI):
         _scheduler.shutdown(wait=False)
     if DISKCACHE_OK:
         _disk_cache.close()
+    try:
+        await _get_solana_bot().close()
+    except Exception:
+        pass
 
 app       = FastAPI(title="macro_alpha v3", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
@@ -2334,6 +2346,62 @@ async def api_jupiter_tokens():
         "count":        len(KNOWN_TOKENS),
         "note":         "Tout token Solana listé sur Jupiter est supporté",
     })
+
+
+# ══════════════════════════════════════════════════════════════
+# ROUTES SOLANA BOT AUTONOME
+# ══════════════════════════════════════════════════════════════
+
+_solana_bot = None
+
+def _get_solana_bot():
+    global _solana_bot
+    if _solana_bot is None:
+        from modules.solana_bot import SolanaBot
+        _solana_bot = SolanaBot()
+    return _solana_bot
+
+
+@app.post("/api/solana-bot/start")
+async def api_bot_start():
+    """Démarrer le bot autonome."""
+    bot = _get_solana_bot()
+    result = await bot.start()
+    return safe_jsonify(result)
+
+
+@app.post("/api/solana-bot/stop")
+async def api_bot_stop():
+    """Arrêter le bot autonome."""
+    bot = _get_solana_bot()
+    result = await bot.stop()
+    return safe_jsonify(result)
+
+
+@app.get("/api/solana-bot/status")
+async def api_bot_status():
+    """Statut complet du bot : positions, perf, log."""
+    bot = _get_solana_bot()
+    return safe_jsonify(bot.get_status())
+
+
+@app.post("/api/solana-bot/buy")
+async def api_bot_manual_buy(request: Request):
+    """Achat manuel via le bot."""
+    data       = await request.json()
+    symbol     = data.get("symbol", "").upper()
+    amount     = float(data.get("amount_usdc", 10))
+    bot        = _get_solana_bot()
+    result     = await bot.manual_buy(symbol, amount)
+    return safe_jsonify(result)
+
+
+@app.post("/api/solana-bot/close/{position_id}")
+async def api_bot_close(position_id: str):
+    """Fermer une position manuellement."""
+    bot    = _get_solana_bot()
+    result = await bot.manual_close(position_id)
+    return safe_jsonify(result)
 
 
 if __name__ == "__main__":
