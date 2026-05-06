@@ -132,7 +132,8 @@ class SolanaBot:
         await self._get_session()   # crée la session une seule fois
         self._scan_task   = asyncio.create_task(self._scan_loop())
         self._mon_task    = asyncio.create_task(self._monitor_loop())
-        self._stream_task = asyncio.create_task(self._start_stream())
+        # Stream WebSocket désactivé — parsing trop bruité, flood event loop
+        # self._stream_task = asyncio.create_task(self._start_stream())
         cap  = self._total_capital()
         mode = "PAPER" if self.dry_run else "LIVE"
         self._log("BOT_START",
@@ -155,6 +156,7 @@ class SolanaBot:
         closed_pos = [p for p in positions if p["status"] == "closed"]
         wins       = [p for p in closed_pos if (p.get("pnl_pct") or 0) > 0]
         realized   = sum(p.get("pnl_usdc") or 0 for p in closed_pos)
+        unrealized = sum(p.get("pnl_usdc") or 0 for p in open_pos)
         total_cap  = self._total_capital()
         invested   = self._invested_capital()
         return {
@@ -170,7 +172,8 @@ class SolanaBot:
             "total_trades":    len(closed_pos),
             "win_rate":        round(len(wins) / max(1, len(closed_pos)) * 100, 1),
             "realized_pnl":    round(realized, 4),
-            "total_pnl_usdc":  round(realized, 4),
+            "unrealized_pnl":  round(unrealized, 6),
+            "total_pnl_usdc":  round(realized + unrealized, 6),
             "positions":       positions,
             "log":             self._load_log()[-50:],
             "agent_context":   self._agent_context(),
@@ -578,25 +581,19 @@ class SolanaBot:
         if not open_pos:
             return
 
-        # Fetch les prix avec concurrence limitée à 2 (évite le rate-limit DexScreener)
-        mints = [
-            (pos, pos.get("mint") or KNOWN_MINTS.get(pos["symbol"], ""))
-            for pos in open_pos
-        ]
-        _sem = asyncio.Semaphore(2)
-
-        async def fetch_one(pos, mint):
-            async with _sem:
+        # Fetch séquentiel avec pause — évite le rate-limit DexScreener sur GCP
+        mints   = [(pos, pos.get("mint") or KNOWN_MINTS.get(pos["symbol"], ""))
+                   for pos in open_pos]
+        results = []
+        for pos, mint in mints:
+            try:
                 p = await self._fetch_price_dex(mint) if mint else None
                 if not p:
-                    await asyncio.sleep(0.5)
                     p = await self._fetch_price_birdeye(mint) if mint else None
-                return pos, p
-
-        results = await asyncio.gather(
-            *[fetch_one(pos, mint) for pos, mint in mints],
-            return_exceptions=True,
-        )
+                results.append((pos, p))
+            except Exception as e:
+                results.append(e)
+            await asyncio.sleep(0.8)  # 0.8s entre chaque appel
 
         updated = failed = corrupt = 0
 

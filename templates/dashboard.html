@@ -2343,10 +2343,12 @@ function _applyBotData(d) {
     // Stats header
     setEl('bot-pos-count', d.open_positions ?? 0);
     setEl('bot-winrate', (d.win_rate ?? 0) + '%');
-    const pnl   = d.realized_pnl ?? d.total_pnl_usdc ?? 0;
+    const realized   = d.realized_pnl ?? 0;
+    const unrealized = d.unrealized_pnl ?? 0;
+    const pnl        = d.total_pnl_usdc ?? (realized + unrealized);
     const pnlEl = document.getElementById('bot-total-pnl');
     if (pnlEl) {
-        pnlEl.textContent = (pnl >= 0 ? '+' : '') + (+pnl).toFixed(4) + ' ' + cur;
+        pnlEl.textContent = (pnl >= 0 ? '+' : '') + (+pnl).toFixed(6) + ' ' + cur;
         pnlEl.style.color = pnl >= 0 ? 'var(--bull)' : 'var(--bear)';
     }
     // Stats panel
@@ -2354,7 +2356,10 @@ function _applyBotData(d) {
     setEl('bs-wr', (d.win_rate ?? 0) + '%');
     const bsPnlEl = document.getElementById('bs-pnl');
     if (bsPnlEl) {
-        bsPnlEl.textContent = (pnl >= 0 ? '+' : '') + (+pnl).toFixed(4) + ' ' + cur;
+        const pnlLine = `${pnl>=0?'+':''}${(+pnl).toFixed(6)} ${cur}`;
+        const unrLine = unrealized !== 0
+            ? ` <span style="font-size:7px;opacity:.7">(${unrealized>=0?'+':''}${(+unrealized).toFixed(6)} open)</span>` : '';
+        bsPnlEl.innerHTML = pnlLine + unrLine;
         bsPnlEl.style.color = pnl >= 0 ? 'var(--bull)' : 'var(--bear)';
     }
     setEl('bs-open', (d.open_positions ?? 0) + '/' + (d.max_positions ?? 6));
@@ -2459,37 +2464,39 @@ function renderBotPositions(positions, cur) {
     }
     const now = Date.now();
     el.innerHTML = open.map(p => {
-        const pnl        = p.pnl_pct ?? 0;
-        const priceStale = p.current_price === p.entry_price;
-        const updatedAt  = p.updated_at ? new Date(p.updated_at) : null;
-        const ageMin     = updatedAt ? Math.round((now - updatedAt) / 60000) : null;
-        const noPrice    = priceStale && ageMin !== null && ageMin < 5;
-        const cls        = pnl > 0 ? 'profit' : pnl < 0 ? 'loss' : '';
-        const clr        = pnl > 0 ? 'var(--bull)' : pnl < 0 ? 'var(--bear)' : 'var(--text3)';
-        const tp1hit     = p.tp1_hit ? ' · TP1 ✓' : '';
-        const paper      = p.dry_run ? ' PAPER' : ' LIVE';
-        const pnlLabel   = noPrice
-            ? '<span style="color:var(--text3);font-size:9px">prix N/A</span>'
-            : `<span style="color:${clr};font-size:12px;font-weight:700">${pnl>=0?'+':''}${pnl.toFixed(1)}%</span>`;
-        const updLabel   = ageMin !== null
-            ? `<span style="font-size:6px;color:var(--text3)">màj il y a ${ageMin}min</span>`
-            : '';
+        const pnl       = p.pnl_pct ?? 0;
+        const updatedAt = p.updated_at ? new Date(p.updated_at) : null;
+        const ageSec    = updatedAt ? Math.round((now - updatedAt) / 1000) : null;
+        const ageMin    = ageSec !== null ? Math.round(ageSec / 60) : null;
+        // Prix périmé si pas de mise à jour depuis > 10 min
+        const noPrice   = ageSec !== null && ageSec > 600;
+        const cls       = pnl > 0 ? 'profit' : pnl < 0 ? 'loss' : '';
+        const clr       = pnl > 0 ? 'var(--bull)' : pnl < 0 ? 'var(--bear)' : 'var(--text3)';
+        const tp1hit    = p.tp1_hit ? ' · TP1✓' : '';
+        const moonbag   = p.is_moonbag ? ' · 🌙' : '';
+        const paper     = p.dry_run ? 'PAPER' : 'LIVE';
+        const pnlStr    = noPrice ? '—' : `${pnl>=0?'+':''}${pnl.toFixed(2)}%`;
+        const pnlSol    = noPrice ? '—' : `${pnl>=0?'+':''}${(p.pnl_usdc||0).toFixed(6)} ${cur}`;
+        const ageLabel  = ageSec !== null
+            ? (ageSec < 60 ? `${ageSec}s` : `${ageMin}min`) + ' ago'
+            : '—';
+        const priceDisp = noPrice ? '—' : `$${(p.current_price||0).toExponential(3)}`;
         return `<div class="pos-card ${cls}">
           <div class="pos-card-header">
             <span class="pos-card-symbol">${p.symbol}</span>
-            <span class="pos-card-badge" style="background:${pnl>0?'rgba(0,230,118,0.1)':pnl<0?'rgba(255,61,90,0.1)':'var(--bg4)'};color:${clr}">${paper}${tp1hit}</span>
-            ${pnlLabel}
+            <span class="pos-card-badge" style="background:${pnl>0?'rgba(0,230,118,0.1)':pnl<0?'rgba(255,61,90,0.1)':'var(--bg4)'};color:${clr}">${paper}${tp1hit}${moonbag}</span>
+            <span style="color:${clr};font-size:12px;font-weight:700">${pnlStr}</span>
           </div>
           <div class="pos-card-detail">
-            <div><div style="color:var(--text3)">Entrée</div><div class="pos-card-val">$${(p.entry_price||0).toFixed(6)}</div></div>
-            <div><div style="color:var(--text3)">Actuel</div><div class="pos-card-val" style="color:${noPrice?'var(--text3)':clr}">${noPrice?'—':'$'+(p.current_price||0).toFixed(6)}</div></div>
+            <div><div style="color:var(--text3)">Entrée</div><div class="pos-card-val">$${(p.entry_price||0).toExponential(3)}</div></div>
+            <div><div style="color:var(--text3)">Actuel</div><div class="pos-card-val" style="color:${noPrice?'var(--text3)':clr}">${priceDisp}</div></div>
             <div><div style="color:var(--text3)">Taille</div><div class="pos-card-val">${(p.amount_usdc||0).toFixed(4)} ${cur}</div></div>
-            <div><div style="color:var(--text3)">SL</div><div class="pos-card-val" style="color:var(--bear)">$${(p.sl_price||0).toFixed(6)}</div></div>
-            <div><div style="color:var(--text3)">TP1</div><div class="pos-card-val" style="color:var(--bull)">$${(p.tp1_price||0).toFixed(6)}</div></div>
-            <div><div style="color:var(--text3)">PnL</div><div class="pos-card-val" style="color:${clr}">${noPrice?'—':(p.pnl_usdc||0).toFixed(4)+' '+cur}</div></div>
+            <div><div style="color:var(--text3)">SL</div><div class="pos-card-val" style="color:var(--bear)">$${(p.sl_price||0).toExponential(3)}</div></div>
+            <div><div style="color:var(--text3)">TP1</div><div class="pos-card-val" style="color:var(--bull)">$${(p.tp1_price||0).toExponential(3)}</div></div>
+            <div><div style="color:var(--text3)">PnL</div><div class="pos-card-val" style="color:${clr}">${pnlSol}</div></div>
           </div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px">
-            ${updLabel}
+            <span style="font-size:6px;color:${noPrice?'var(--bear)':'var(--text3)'}">màj ${ageLabel}${noPrice?' ⚠':''}</span>
             <button onclick="closePosition('${p.id}')" class="btn btn-sell" style="padding:2px 8px;font-size:7px">✕ Fermer</button>
           </div>
         </div>`;
