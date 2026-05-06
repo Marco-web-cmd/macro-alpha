@@ -611,12 +611,18 @@ class SolanaBot:
             entry = pos["entry_price"]
             ratio = price / entry if entry > 0 else 0
 
-            # Données corrompues → pause sécurité sur ce cycle
+            # Données corrompues → pause sécurité (sauf crash réel sous SL)
+            sl_ratio = 1 - SL_PCT / 100   # ex: 0.85 pour SL=15%
             if ratio > MAX_PRICE_DRIFT or (ratio > 0 and ratio < 1 / MAX_PRICE_DRIFT):
-                corrupt += 1
-                self._log("ERREUR",
-                    f"⚠ {sym} prix suspect (x{ratio:.1f}) — pause sécurité ce cycle")
-                continue
+                # Si le prix est en dessous du SL, c'est probablement un vrai crash
+                if ratio > 0 and ratio < sl_ratio:
+                    # Laisser passer pour déclencher le stop-loss
+                    pass
+                else:
+                    corrupt += 1
+                    self._log("ERREUR",
+                        f"⚠ {sym} prix suspect (x{ratio:.1f}) — pause sécurité ce cycle")
+                    continue
 
             pnl_pct = (price - entry) / entry * 100
 
@@ -631,7 +637,7 @@ class SolanaBot:
             pos.update({
                 "current_price":  price,
                 "pnl_pct":        round(pnl_pct, 2),
-                "pnl_usdc":       round(pos["amount_usdc"] * pnl_pct / 100, 4),
+                "pnl_usdc":       round(pos["amount_usdc"] * pnl_pct / 100, 6),
                 "remaining_usdc": round(pos["amount_usdc"] * remaining_frac, 4),
                 "updated_at":     _now(),
             })
