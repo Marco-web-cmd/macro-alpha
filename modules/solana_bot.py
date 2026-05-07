@@ -24,16 +24,20 @@ MAX_POSITIONS     = 6
 SL_PCT            = 15.0
 TP1_PCT           = 30.0
 TP2_PCT           = 60.0
-MOONBAG_TRAIL_BASE = 12.0   # % trailing depuis pic (s'élargit avec le gain)
+MOONBAG_TRAIL_BASE = 8.0    # trailing agressif dès TP1 (était 12)
 MAX_PRICE_DRIFT   = 3.0
 MAX_RISK_PCT      = 0.20
 MIN_POSITION      = 0.01 if os.getenv("BASE_CURRENCY", "SOL").upper() == "SOL" else 1.5
 MIN_SCORE         = 60
-MIN_LIQ_MC_RATIO  = 0.02    # liquidité doit être ≥ 2% du market cap (anti-liquidity trap)
-MIN_LIQ_USD       = 20 * 150.0  # ≈ 20 SOL en USD (filtre rapide avant analyse)
-SCAN_INTERVAL     = 30 * 60
+MIN_SCORE_COPY    = 40      # seuil réduit pour copy trades (wallet = signal de confiance)
+MIN_LIQ_MC_RATIO  = 0.02
+MIN_LIQ_USD       = 20 * 150.0
+SCAN_INTERVAL     = 5 * 60  # 5 min (était 30 min — memecoins vivent 15-45 min)
 MONITOR_INTERVAL  = 2 * 60
 JUPITER_MAX_RETRY = 3
+TIME_STOP_MINUTES = 20      # ferme si pas de mouvement après 20 min
+TIME_STOP_MIN_MOVE_PCT = 3.0  # mouvement minimal requis pour ne pas déclencher le time-stop
+FRESHNESS_LIMIT_MIN = 30    # ignore les tokens créés il y a plus de 30 min dans le scan
 
 POSITIONS_FILE = "data/solana_positions.json"
 LOG_FILE       = "data/bot_log.json"
@@ -398,10 +402,7 @@ class SolanaBot:
 
         score = self._score(token_data)
 
-        # Pour le copy trading on accepte un score plus bas (55 vs 70)
-        # Le signal "smart money" compense le score manquant
-        COPY_MIN_SCORE = 55
-        if score < COPY_MIN_SCORE:
+        if score < MIN_SCORE_COPY:
             log.info("copy_token_rejected", sym=sym, score=score,
                      wallet=wallet_label)
             return
@@ -604,35 +605,42 @@ class SolanaBot:
     async def _preflight_check(self, mint: str, sym: str) -> dict:
         """
         Vérifie avant tout achat :
-        1. Freeze authority → BLOCK (le créateur peut bloquer les ventes)
-        2. Top holder > 10% → BLOCK (whale trap / rug probable)
+        1. Freeze authority → BLOCK
+        2. Top holder > 50% du supply total → BLOCK (calcul corrigé)
+        3. Anti-sniper : > 50% des premières txs depuis même wallet → BLOCK
         Retourne {"ok": bool, "reason": str}
         """
         try:
-            from modules.solana_rpc import check_token_safety, get_top_holders
+            from modules.solana_rpc import (check_token_safety, get_top_holders,
+                                             check_sniper_concentration)
             s = await self._get_session()
 
-            safety, holders = await asyncio.gather(
+            safety, holders, sniper = await asyncio.gather(
                 check_token_safety(mint, s),
                 get_top_holders(mint, s, max_concentration_pct=50.0),
+                check_sniper_concentration(mint, s),
             )
 
             if not safety.get("safe", True):
                 reason = safety.get("reason", "freezeAuthority présente")
-                self._log("PREFLIGHT",
-                    f"🚫 {sym} rejeté — {reason}", sym)
+                self._log("PREFLIGHT", f"🚫 {sym} rejeté — {reason}", sym)
                 return {"ok": False, "reason": reason}
 
             if holders.get("concentrated", False):
                 pct    = holders.get("top_holder_pct", 0)
-                reason = f"top holder détient {pct:.1f}% (whale trap)"
-                self._log("PREFLIGHT",
-                    f"🚫 {sym} rejeté — {reason}", sym)
+                reason = f"top holder détient {pct:.1f}% du supply (whale trap)"
+                self._log("PREFLIGHT", f"🚫 {sym} rejeté — {reason}", sym)
+                return {"ok": False, "reason": reason}
+
+            if sniper.get("sniped", False):
+                pct    = sniper.get("top_sender_pct", 0)
+                reason = f"bot sniper détecté ({pct*100:.0f}% des premières txs)"
+                self._log("PREFLIGHT", f"🚫 {sym} rejeté — {reason}", sym)
                 return {"ok": False, "reason": reason}
 
             if safety.get("mint_authority"):
                 self._log("PREFLIGHT",
-                    f"⚠ {sym} mintAuthority présente (dilution possible) — entrée réduite", sym)
+                    f"⚠ {sym} mintAuthority présente (dilution possible)", sym)
 
             return {"ok": True, "reason": ""}
 
@@ -658,14 +666,14 @@ class SolanaBot:
     @staticmethod
     def _moonbag_trail_pct(pnl_pct: float) -> float:
         """
-        Trailing stop adaptatif selon le gain réalisé.
-        Plus le gain est important, plus on donne de marge au moonbag
-        pour éviter d'être sorti trop tôt sur une bougie de correction.
+        Trailing stop adaptatif — agressif dès le départ, s'élargit avec les gains.
+        Objectif : protéger le capital rapidement, laisser courir les gros winners.
         """
-        if pnl_pct >= 200:  return 25.0
-        if pnl_pct >= 100:  return 20.0
-        if pnl_pct >= 60:   return 15.0
-        return MOONBAG_TRAIL_BASE  # 12% par défaut
+        if pnl_pct >= 300:  return 30.0   # winner extrême — large marge
+        if pnl_pct >= 150:  return 22.0
+        if pnl_pct >= 80:   return 15.0
+        if pnl_pct >= 40:   return 10.0
+        return MOONBAG_TRAIL_BASE          # 8% dès +20%
 
     # ── Scan ──────────────────────────────────────────────────
 
@@ -683,11 +691,19 @@ class SolanaBot:
         market_regime = ctx["market_regime"]
         size_mult     = ctx["size_mult"]
 
+        # Solana regime — activité réseau (fees = proxy d'activité)
+        try:
+            from modules.solana_rpc import get_solana_regime
+            sol_regime = await get_solana_regime(await self._get_session())
+        except Exception:
+            sol_regime = {"active": True, "score": 0.5, "median_fee": 0}
+
+        regime_label = "ACTIF" if sol_regime["active"] else "CALME"
         self._log("SCAN",
             f"🔍 Scan | {total_cap:.4f} {BASE_CURRENCY} "
             f"(investi: {invested:.4f} | dispo: {available:.4f}) "
             f"| {len(open_pos)}/{MAX_POSITIONS} pos "
-            f"| Macro {macro_score:.0f} | {cycle_phase} | {market_regime} "
+            f"| Solana {regime_label} (fee={sol_regime['median_fee']:,}) "
             f"| x{size_mult}")
 
         if slots <= 0 or available < MIN_POSITION:
@@ -708,6 +724,9 @@ class SolanaBot:
 
         self._log("SCAN", f"📊 {len(tokens)} tokens reçus…")
 
+        import time as _time
+        now_ts = _time.time()
+
         held   = {p["symbol"] for p in open_pos}
         scored = []
         for t in tokens:
@@ -715,19 +734,26 @@ class SolanaBot:
             if not sym or sym in held or sym in ("USDC", "USDT", "BUSD", "SOL", "WSOL"):
                 continue
 
+            # Filtre fraîcheur : skip les tokens trop vieux (> FRESHNESS_LIMIT_MIN)
+            created_at = t.get("pairCreatedAt") or t.get("createdAt") or 0
+            if created_at:
+                try:
+                    age_min = (now_ts - float(created_at) / 1000) / 60
+                    if age_min > FRESHNESS_LIMIT_MIN:
+                        continue
+                except Exception:
+                    pass
+
             liq = float(t.get("liquidity") or 0)
             mc  = float(t.get("mc") or t.get("market_cap") or 0)
 
-            # Filtre rapide : liq minimale (≈ 20 SOL)
             if liq < MIN_LIQ_USD:
                 continue
-
-            # Filtre anti-liquidity-trap : liq doit être ≥ 2% du MC
             if mc > 0 and liq / mc < MIN_LIQ_MC_RATIO:
                 continue
 
             score = self._score(t)
-            if score >= 55:   # pré-sélection large avant enrichissement
+            if score >= 55:
                 scored.append((score, t))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -882,6 +908,23 @@ class SolanaBot:
             })
             updated += 1
 
+            # ── Time-stop : ferme si pas de mouvement après TIME_STOP_MINUTES ──
+            opened_at  = pos.get("opened_at")
+            if opened_at and not pos.get("tp1_hit") and not is_moonbag:
+                try:
+                    from datetime import datetime, timezone
+                    age_min = (datetime.now(timezone.utc) -
+                               datetime.fromisoformat(opened_at)).total_seconds() / 60
+                    if age_min >= TIME_STOP_MINUTES and abs(pnl_pct) < TIME_STOP_MIN_MOVE_PCT:
+                        self._log("TIME_STOP",
+                            f"⏱ {sym} time-stop — {age_min:.0f}min sans mouvement "
+                            f"({pnl_pct:+.1f}%) → clôture", sym)
+                        await self._partial_close(pos, price, "TIME_STOP",
+                                                  remaining_frac, positions)
+                        continue
+                except Exception:
+                    pass
+
             # ── Stop-loss ──
             if pnl_pct <= -SL_PCT:
                 await self._partial_close(pos, price, "STOP_LOSS",
@@ -911,16 +954,29 @@ class SolanaBot:
                 self._log("TP2",
                     f"🎯 {sym} TP2 +{pnl_pct:.1f}% — 90% vendu, 10% moonbag", sym)
 
-            # ── TP1 : vend 50%, laisse 50% courir ──
+            # ── TP1 : vend 50%, trailing sur le reste dès TP1 ──
             elif pnl_pct >= TP1_PCT and not pos.get("tp1_hit"):
                 sell_frac = remaining_frac * 0.50
                 await self._partial_close(pos, price, "TP1_PARTIAL",
                                           sell_frac, positions)
                 pos["remaining_fraction"] = remaining_frac * 0.50
                 pos["tp1_hit"]            = True
+                pos["is_moonbag"]         = True   # active le trailing immédiatement
+                pos["peak_price"]         = price
                 pos["sl_price"]           = entry
                 self._log("TP1",
-                    f"💰 {sym} TP1 +{pnl_pct:.1f}% — 50% vendu, SL → breakeven", sym)
+                    f"💰 {sym} TP1 +{pnl_pct:.1f}% — 50% vendu, trailing actif sur reste", sym)
+
+            # ── Trailing pré-TP1 : protège les gains si forte hausse ──
+            elif pnl_pct >= 20.0 and not pos.get("tp1_hit"):
+                trail_pct      = self._moonbag_trail_pct(pnl_pct)
+                drop_from_peak = (peak - price) / peak * 100 if peak > 0 else 0
+                if drop_from_peak >= trail_pct:
+                    self._log("TRAIL_EARLY",
+                        f"📉 {sym} trailing pré-TP1 +{pnl_pct:.1f}% — "
+                        f"recul {drop_from_peak:.1f}% (trail {trail_pct:.0f}%)", sym)
+                    await self._partial_close(pos, price, "TRAIL_EARLY",
+                                              remaining_frac, positions)
 
         self._save_positions(positions)
         total_cap = self._total_capital()

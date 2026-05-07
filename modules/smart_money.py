@@ -67,22 +67,117 @@ SMART_MONEY_WALLETS = _parse_wallets()
 
 class SmartMoneyTracker:
     """
-    Poll les wallets smart money toutes les POLL_INTERVAL secondes.
-    Détecte les achats de tokens (SWAP où le wallet reçoit un non-stable).
-    Appelle le callback pour chaque achat détecté.
+    Surveille les wallets smart money en temps réel.
+
+    Mode 1 — Helius Webhooks (prioritaire) :
+      Helius pousse les transactions instantanément via POST /api/helius-webhook.
+      L'app.py appelle handle_webhook_event() → latence < 1s.
+
+    Mode 2 — Polling fallback (15s) :
+      Si les webhooks ne sont pas configurés ou échouent, polling toutes les 15s
+      (vs 60s avant = 4x plus rapide).
     """
 
-    POLL_INTERVAL = 60   # secondes entre chaque vérification par wallet
+    POLL_INTERVAL  = 15   # réduit de 60s → 15s
+    WEBHOOK_SERVER = os.getenv("PUBLIC_URL", "")  # ex: http://35.225.188.104:5001
 
     def __init__(self):
         self._running    = False
         self._tasks: list[asyncio.Task] = []
-        self._seen_sigs: dict[str, Set[str]] = {}  # wallet → signatures vues
+        self._seen_sigs: dict[str, Set[str]] = {}
         self._callback: Optional[Callable] = None
+        self._webhook_id: Optional[str]    = None
+        self._webhook_active: bool         = False
 
     @property
     def wallet_count(self) -> int:
         return len(SMART_MONEY_WALLETS)
+
+    async def handle_webhook_event(self, events: list):
+        """
+        Appelé par app.py quand Helius pousse un événement webhook.
+        Traite la liste d'événements et déclenche le callback si c'est un achat.
+        """
+        if not self._callback or not self._running:
+            return
+        for tx in events:
+            sig = tx.get("signature", "")
+            if not sig:
+                continue
+            # Trouve quel wallet est concerné
+            for w in SMART_MONEY_WALLETS:
+                seen = self._seen_sigs.get(w["address"], set())
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                self._seen_sigs[w["address"]] = seen
+                buy = self._parse_buy(tx, w["address"])
+                if buy:
+                    buy["wallet"]       = w["address"]
+                    buy["wallet_label"] = w["label"]
+                    buy["signature"]    = sig
+                    buy["source"]       = "copy"
+                    log.info("smart_money_webhook_buy",
+                             wallet=w["label"], mint=buy["mint"][:8])
+                    asyncio.create_task(self._fire(buy))
+
+    async def _register_webhook(self):
+        """
+        Enregistre (ou met à jour) un webhook Helius pour les wallets configurés.
+        Nécessite PUBLIC_URL dans .env — ex: http://35.225.188.104:5001
+        """
+        if not self.WEBHOOK_SERVER or not HELIUS_KEY:
+            return False
+        webhook_url = f"{self.WEBHOOK_SERVER}/api/helius-webhook"
+        addresses   = [w["address"] for w in SMART_MONEY_WALLETS]
+        payload = {
+            "webhookURL":       webhook_url,
+            "transactionTypes": ["SWAP"],
+            "accountAddresses": addresses,
+            "webhookType":      "enhanced",
+        }
+        import aiohttp, ssl, certifi
+        ctx = ssl.create_default_context(cafile=certifi.where())
+        try:
+            async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=ctx)
+            ) as session:
+                # Liste les webhooks existants
+                async with session.get(
+                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}"
+                ) as r:
+                    existing = await r.json() if r.status == 200 else []
+
+                # Supprime les anciens webhooks sur notre URL
+                for wh in (existing if isinstance(existing, list) else []):
+                    if wh.get("webhookURL") == webhook_url:
+                        wid = wh.get("webhookID", "")
+                        if wid:
+                            await session.delete(
+                                f"https://api.helius.xyz/v0/webhooks/{wid}?api-key={HELIUS_KEY}"
+                            )
+
+                # Crée le nouveau webhook
+                async with session.post(
+                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}",
+                    json=payload,
+                ) as r:
+                    if r.status in (200, 201):
+                        data = await r.json()
+                        self._webhook_id     = data.get("webhookID")
+                        self._webhook_active = True
+                        log.info("smart_money_webhook_registered",
+                                 id=self._webhook_id, url=webhook_url,
+                                 wallets=len(addresses))
+                        return True
+                    else:
+                        body = await r.text()
+                        log.warning("smart_money_webhook_failed",
+                                    status=r.status, body=body[:200])
+                        return False
+        except Exception as e:
+            log.warning("smart_money_webhook_error", error=str(e))
+            return False
 
     async def start(self, callback: Callable):
         if not HELIUS_KEY:
@@ -97,11 +192,23 @@ class SmartMoneyTracker:
         self._callback = callback
         for w in SMART_MONEY_WALLETS:
             self._seen_sigs[w["address"]] = set()
+
+        # Tente d'enregistrer les webhooks Helius (temps réel)
+        webhook_ok = await self._register_webhook()
+        if not webhook_ok:
+            log.info("smart_money_polling_mode",
+                     interval=self.POLL_INTERVAL,
+                     hint="Configure PUBLIC_URL dans .env pour activer les webhooks")
+
+        # Lance toujours le polling en parallèle (fallback ou backup)
+        for w in SMART_MONEY_WALLETS:
             task = asyncio.create_task(self._poll_loop(w))
             self._tasks.append(task)
 
         log.info("smart_money_started",
-                 wallets=[w["label"] for w in SMART_MONEY_WALLETS])
+                 wallets=[w["label"] for w in SMART_MONEY_WALLETS],
+                 webhook=webhook_ok,
+                 poll_interval=self.POLL_INTERVAL)
 
     async def stop(self):
         self._running = False

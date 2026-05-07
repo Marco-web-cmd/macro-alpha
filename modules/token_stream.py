@@ -18,8 +18,9 @@ log = structlog.get_logger()
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "")
 WS_URL     = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
 
-RAYDIUM_AMM = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
-PUMPFUN     = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+RAYDIUM_AMM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+PUMPFUN      = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+PUMPFUN_AMM  = "pAMMBay6oceH9fJKBjAn43VQ1ARNJ8hEi9cNFHVxnME"  # pump.fun AMM v2 (graduation)
 
 # ── Adresses système / programmes connus à exclure ────────────
 EXCLUDE_ADDRS: Set[str] = {
@@ -107,8 +108,9 @@ class TokenStream:
         self._seen_mints: Set[str] = set()
         self._tasks     = []
         self._limiters  = {
-            "raydium": _RateLimiter(),
-            "pumpfun":  _RateLimiter(),
+            "raydium":    _RateLimiter(),
+            "pumpfun":    _RateLimiter(),
+            "graduation": _RateLimiter(),
         }
 
     async def start(self, callback: Callable):
@@ -129,8 +131,10 @@ class TokenStream:
                 self._subscribe(RAYDIUM_AMM, "initialize2", "raydium")),
             asyncio.create_task(
                 self._subscribe(PUMPFUN, "create", "pumpfun")),
+            asyncio.create_task(
+                self._subscribe(PUMPFUN_AMM, "buy", "graduation")),
         ]
-        log.info("token_stream_started", sources=["raydium", "pumpfun"])
+        log.info("token_stream_started", sources=["raydium", "pumpfun", "graduation"])
 
     async def stop(self):
         self._running = False

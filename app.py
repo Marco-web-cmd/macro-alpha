@@ -2484,6 +2484,28 @@ async def api_bot_status():
     return safe_jsonify(bot.get_status())
 
 
+@app.post("/api/helius-webhook")
+async def api_helius_webhook(request: Request):
+    """
+    Endpoint Helius Webhook — reçoit les transactions en temps réel.
+    Helius POST ici dès qu'un des wallets smart money fait un SWAP.
+    Transmet immédiatement au SmartMoneyTracker du bot.
+    """
+    try:
+        events = await request.json()
+        if not isinstance(events, list):
+            events = [events]
+        bot = _get_solana_bot()
+        tracker = getattr(bot, "_smart_money", None)
+        if tracker and hasattr(tracker, "handle_webhook_event"):
+            asyncio.create_task(tracker.handle_webhook_event(events))
+        logger.info("[Webhook] Helius: %d événements reçus", len(events))
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        logger.warning("[Webhook] Erreur: %s", e)
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=400)
+
+
 @app.post("/api/solana-bot/buy")
 async def api_bot_manual_buy(request: Request):
     """Achat manuel via le bot."""
