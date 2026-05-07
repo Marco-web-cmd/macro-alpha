@@ -37,7 +37,7 @@ MONITOR_INTERVAL  = 2 * 60
 JUPITER_MAX_RETRY = 3
 TIME_STOP_MINUTES = 20      # ferme si pas de mouvement après 20 min
 TIME_STOP_MIN_MOVE_PCT = 3.0  # mouvement minimal requis pour ne pas déclencher le time-stop
-FRESHNESS_LIMIT_MIN = 30    # ignore les tokens créés il y a plus de 30 min dans le scan
+FRESHNESS_LIMIT_MIN = 8     # ignore les tokens créés il y a plus de 8 min dans le scan
 
 POSITIONS_FILE = "data/solana_positions.json"
 LOG_FILE       = "data/bot_log.json"
