@@ -489,15 +489,15 @@ class SolanaBot:
                     break
 
             if not agent:
-                # Cache vide : agent pas encore appelé — prudence partielle
+                # Cache vide : agent pas encore lancé → taille réduite mais on trade quand même
                 full  = cache.get("full_1h_24h", {})
                 macro = full.get("macro", {})
                 ms    = float(macro.get("score", 0) or 0)
                 return {
-                    "macro_score":   ms,
+                    "macro_score":   max(ms, 50.0),  # score neutre par défaut
                     "cycle_phase":   "UNKNOWN",
                     "market_regime": "UNKNOWN",
-                    "size_mult":     0.5 if ms > 0 else 0.0,
+                    "size_mult":     0.5,             # taille réduite, jamais 0
                     "source":        "full_cache_only",
                 }
 
@@ -885,6 +885,17 @@ class SolanaBot:
 
             if not price:
                 failed += 1
+                # Auto-clôture si prix introuvable depuis trop longtemps
+                misses = pos.get("price_miss_count", 0) + 1
+                pos["price_miss_count"] = misses
+                if misses >= 5:
+                    last_price = pos.get("current_price") or pos["entry_price"]
+                    self._log("ERREUR",
+                        f"💀 {sym} — prix absent {misses} cycles consécutifs → clôture forcée",
+                        sym)
+                    await self._partial_close(
+                        pos, last_price, "NO_PRICE",
+                        pos.get("remaining_fraction", 1.0), positions)
                 continue
 
             entry = pos["entry_price"]
@@ -914,11 +925,12 @@ class SolanaBot:
             is_moonbag     = pos.get("is_moonbag", False)
 
             pos.update({
-                "current_price":  price,
-                "pnl_pct":        round(pnl_pct, 2),
-                "pnl_usdc":       round(pos["amount_usdc"] * pnl_pct / 100, 6),
-                "remaining_usdc": round(pos["amount_usdc"] * remaining_frac, 4),
-                "updated_at":     _now(),
+                "current_price":    price,
+                "pnl_pct":          round(pnl_pct, 2),
+                "pnl_usdc":         round(pos["amount_usdc"] * pnl_pct / 100, 6),
+                "remaining_usdc":   round(pos["amount_usdc"] * remaining_frac, 4),
+                "updated_at":       _now(),
+                "price_miss_count": 0,  # reset dès qu'on a un prix
             })
             updated += 1
 
@@ -1310,8 +1322,11 @@ class SolanaBot:
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
             ) as r:
                 d = await r.json()
+            if not d or not isinstance(d, dict):
+                return None
+            raw_pairs = d.get("pairs") or []
             pairs = sorted(
-                [p for p in d.get("pairs", [])
+                [p for p in raw_pairs
                  if float((p.get("liquidity") or {}).get("usd") or 0) > 10_000],
                 key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
                 reverse=True,
