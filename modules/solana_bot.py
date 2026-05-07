@@ -432,8 +432,10 @@ class SolanaBot:
                 f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
             ) as r:
                 d = await r.json()
+            if not d or not isinstance(d, dict):
+                return None
             pairs = sorted(
-                [p for p in d.get("pairs", [])
+                [p for p in (d.get("pairs") or [])
                  if p.get("chainId") == "solana"
                  and float((p.get("liquidity") or {}).get("usd") or 0) > 5_000],
                 key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
