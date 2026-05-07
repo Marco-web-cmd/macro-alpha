@@ -1911,6 +1911,7 @@ function initWebSocket(symbol = 'BTCUSDT') {
 if (isCompact) toggleCompact();
 initCharts();
 loadAll();
+loadBotStatus();   // précharge le statut bot même si l'onglet n'est pas actif
 initWebSocket('BTCUSDT');
 
 // ══════════════════════════════════════════════════════
@@ -2323,8 +2324,9 @@ function _applyBotData(d) {
     const dot = document.getElementById('bot-dot');
     const txt = document.getElementById('bot-status-txt');
     if (dot) dot.classList.toggle('running', _botRunning);
+    const nowStr = new Date().toLocaleTimeString('fr', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
     if (txt) txt.textContent = _botRunning
-        ? `Bot actif — ${(+d.available_usdc).toFixed(4)} ${cur} dispo / ${(+d.total_capital).toFixed(4)} ${cur} total`
+        ? `Bot actif — ${(+d.available_usdc).toFixed(4)} ${cur} dispo / ${(+d.total_capital).toFixed(4)} ${cur} total — màj ${nowStr}`
         : 'Inactif';
 
     // Bouton
