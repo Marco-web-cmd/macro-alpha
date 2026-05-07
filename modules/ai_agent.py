@@ -1490,6 +1490,9 @@ class CryptoAgent:
             "regime_confidence":  state["regime_confidence"],
             "regime_duration_days": state["regime_duration_days"],
             "prev_regime":        state["prev_regime"],
+            # Macro (utilisé par solana_bot._agent_context)
+            "macro_score":        macro_score,
+            "btc_cycle_phase":    cycle_phase,
             # Narratif
             "market_narrative":   narrative,
             # Prédictions actives

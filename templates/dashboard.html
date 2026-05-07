@@ -968,6 +968,18 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
           Signal agent IA non disponible — lancer un scan depuis l'onglet Agent
         </div>
 
+        <!-- Copy Trading — Smart Money -->
+        <div class="bot-section" id="sm-section">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <span class="bot-section-title" style="margin:0">👁 Copy Trading — Smart Money</span>
+            <span id="sm-status-badge" style="font-size:7px;padding:2px 7px;border-radius:3px;background:rgba(38,198,218,0.1);color:var(--teal);border:1px solid rgba(38,198,218,0.2)">—</span>
+          </div>
+          <div id="sm-wallets" style="display:flex;flex-direction:column;gap:4px;margin-bottom:6px"></div>
+          <div id="sm-last-signal" style="font-size:7px;color:var(--text3);padding:5px 8px;background:var(--bg3);border-radius:3px;min-height:20px">
+            Aucun signal copy détecté pour l'instant
+          </div>
+        </div>
+
         <!-- Positions ouvertes -->
         <div class="bot-section">
           <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
@@ -2396,8 +2408,42 @@ function _applyBotData(d) {
         agentEl.innerHTML = `<span style="color:${color};font-weight:700">${label}</span> Macro <b>${macro}</b> | ${phase} | ${agentCtx.market_regime || '–'}`;
     }
 
-    // Log (uniquement si différent du dernier rendu)
+    // Log
     renderBotLog(d.log || []);
+
+    // Smart Money / Copy Trading
+    const sm = d.smart_money || {};
+    const smBadge = document.getElementById('sm-status-badge');
+    if (smBadge) {
+        if (sm.active && sm.wallet_count > 0) {
+            smBadge.textContent = `ACTIF — ${sm.wallet_count} wallets`;
+            smBadge.style.color = 'var(--teal)';
+            smBadge.style.borderColor = 'rgba(38,198,218,0.3)';
+        } else {
+            smBadge.textContent = 'INACTIF';
+            smBadge.style.color = 'var(--text3)';
+            smBadge.style.borderColor = 'var(--border)';
+        }
+    }
+    const smWallets = document.getElementById('sm-wallets');
+    if (smWallets && sm.wallets && sm.wallets.length) {
+        smWallets.innerHTML = sm.wallets.map(w =>
+            `<div style="display:flex;align-items:center;gap:6px;font-size:7px;padding:3px 6px;background:var(--bg3);border-radius:3px">
+              <span style="width:5px;height:5px;border-radius:50%;background:var(--teal);display:inline-block;flex-shrink:0"></span>
+              <span style="color:var(--text)">${w}</span>
+            </div>`
+        ).join('');
+    }
+    // Dernier signal copy dans le log
+    const smSignal = document.getElementById('sm-last-signal');
+    if (smSignal) {
+        const copyLogs = (d.log || []).filter(l => (l.message || '').includes('[COPY]') || l.type === 'STREAM_COPY' || (l.message || '').toLowerCase().includes('copy'));
+        if (copyLogs.length) {
+            const last = copyLogs[copyLogs.length - 1];
+            const t = new Date(last.ts).toLocaleTimeString('fr', {hour:'2-digit', minute:'2-digit'});
+            smSignal.innerHTML = `<span style="color:var(--teal)">${t}</span> — ${last.message}`;
+        }
+    }
 }
 
 function _startBotSSE() {

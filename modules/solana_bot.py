@@ -179,6 +179,11 @@ class SolanaBot:
             "positions":       positions,
             "log":             self._load_log()[-50:],
             "agent_context":   self._agent_context(),
+            "smart_money": {
+                "active":       hasattr(self, "_smart_money") and self._smart_money is not None,
+                "wallet_count": getattr(getattr(self, "_smart_money", None), "wallet_count", 0),
+                "wallets":      [w["label"] for w in __import__("modules.smart_money", fromlist=["SMART_MONEY_WALLETS"]).SMART_MONEY_WALLETS],
+            },
         }
 
     # ── Boucles ───────────────────────────────────────────────
@@ -465,93 +470,34 @@ class SolanaBot:
 
     def _agent_context(self) -> dict:
         """
-        Lit le contexte macro depuis le cache interne d'app.py.
-        En cas d'erreur ou d'absence de données : pause prudente (size_mult=0.5).
-        En cas de crash complet : pause totale (size_mult=0).
+        Contexte informatif uniquement — ne bloque jamais les trades Solana.
+        Les memecoins Solana ont leur propre momentum indépendant de la macro BTC.
+        size_mult est toujours 1.0.
         """
         try:
             import sys
             app_module = sys.modules.get("app") or sys.modules.get("__main__")
             cache = getattr(app_module, "_cache", None) if app_module else None
-
-            if cache is None:
-                # Module app non chargé — prudence maximale
-                return {
-                    "macro_score":   50.0,
-                    "cycle_phase":   "UNKNOWN",
-                    "market_regime": "UNKNOWN",
-                    "size_mult":     0.5,
-                    "source":        "no_app_module",
-                }
-
             agent = None
-            for tf in ("1h", "4h", "1d"):
-                agent = cache.get(f"agent_full_{tf}")
-                if agent:
-                    break
-
-            if not agent:
-                # Cache vide : agent pas encore lancé → taille réduite mais on trade quand même
-                full  = cache.get("full_1h_24h", {})
-                macro = full.get("macro", {})
-                ms    = float(macro.get("score", 0) or 0)
-                return {
-                    "macro_score":   max(ms, 50.0),  # score neutre par défaut
-                    "cycle_phase":   "UNKNOWN",
-                    "market_regime": "UNKNOWN",
-                    "size_mult":     0.5,             # taille réduite, jamais 0
-                    "source":        "full_cache_only",
-                }
-
-            macro_score   = float(agent.get("macro_score", 0) or 0)
-            cycle_phase   = str(agent.get("btc_cycle_phase", "UNKNOWN") or "UNKNOWN").upper()
-            market_regime = str(agent.get("market_regime", "UNKNOWN") or "UNKNOWN").upper()
-
-            # Phases bloquantes
-            BLOCKED = ("LATE_BEAR", "CAPITULATION", "BEAR", "CORRECTION_PROFONDE")
-            if any(b in cycle_phase for b in BLOCKED):
-                return {
-                    "macro_score":   macro_score,
-                    "cycle_phase":   cycle_phase,
-                    "market_regime": market_regime,
-                    "size_mult":     0.0,
-                    "source":        "agent_cache",
-                }
-
-            # Multiplicateur macro
-            if macro_score >= 65:
-                score_mult = 1.0
-            elif macro_score >= 50:
-                score_mult = 0.75
-            elif macro_score >= 35:
-                score_mult = 0.5
-            else:
-                score_mult = 0.0
-
-            # Multiplicateur régime
-            if "BEAR" in market_regime or "RANGING" in market_regime:
-                regime_mult = 0.6
-            elif "BULL" in market_regime:
-                regime_mult = 1.0
-            else:
-                regime_mult = 0.8
-
+            if cache:
+                for tf in ("1h", "4h", "1d"):
+                    agent = cache.get(f"agent_full_{tf}")
+                    if agent:
+                        break
             return {
-                "macro_score":   macro_score,
-                "cycle_phase":   cycle_phase,
-                "market_regime": market_regime,
-                "size_mult":     round(score_mult * regime_mult, 2),
-                "source":        "agent_cache",
+                "macro_score":   float((agent or {}).get("macro_score", 50) or 50),
+                "cycle_phase":   str((agent or {}).get("btc_cycle_phase", "UNKNOWN") or "UNKNOWN").upper(),
+                "market_regime": str((agent or {}).get("market_regime", "UNKNOWN") or "UNKNOWN").upper(),
+                "size_mult":     1.0,
+                "source":        "agent_cache" if agent else "no_cache",
             }
-
         except Exception as e:
-            log.error("agent_context_crash", error=str(e))
-            # Crash de l'agent → on stoppe les entrées par sécurité
+            log.warning("agent_context_error", error=str(e))
             return {
-                "macro_score":   0.0,
-                "cycle_phase":   "ERROR",
-                "market_regime": "ERROR",
-                "size_mult":     0.0,
+                "macro_score":   50.0,
+                "cycle_phase":   "UNKNOWN",
+                "market_regime": "UNKNOWN",
+                "size_mult":     1.0,
                 "source":        "error",
             }
 
@@ -668,7 +614,7 @@ class SolanaBot:
 
             safety, holders = await asyncio.gather(
                 check_token_safety(mint, s),
-                get_top_holders(mint, s),
+                get_top_holders(mint, s, max_concentration_pct=50.0),
             )
 
             if not safety.get("safe", True):

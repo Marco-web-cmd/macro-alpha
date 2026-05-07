@@ -461,13 +461,13 @@ def compute_stoch_monthly(close_daily: pd.Series) -> dict:
     if len(close_daily) < 90:
         return {"available": False, "reason": "Données insuffisantes (< 90 jours)"}
 
-    monthly = close_daily.resample("ME").last().dropna()
+    monthly = close_daily.resample("M").last().dropna()
     if len(monthly) < 14:
         return {"available": False, "reason": f"Seulement {len(monthly)} mois disponibles"}
 
     # High/Low mensuel (approximation via close mensuel)
-    monthly_high = close_daily.resample("ME").max().reindex(monthly.index)
-    monthly_low  = close_daily.resample("ME").min().reindex(monthly.index)
+    monthly_high = close_daily.resample("M").max().reindex(monthly.index)
+    monthly_low  = close_daily.resample("M").min().reindex(monthly.index)
 
     k_period = 3
     lowest_low   = monthly_low.rolling(k_period).min()

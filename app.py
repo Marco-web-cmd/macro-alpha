@@ -342,11 +342,8 @@ def _sanitize(obj):
 
 # ── Binance ──
 def fetch_ohlcv(interval="1h", limit=300):
-    import requests as _req
-    # Essaie Binance ; bascule Bybit si bloqué
     try:
-        url = "https://api.binance.com/api/v3/klines"
-        r   = HTTP_SESSION.get(url, params={
+        r = HTTP_SESSION.get(BINANCE_KLINES, params={
             "symbol": SYMBOL, "interval": interval, "limit": limit
         }, timeout=10)
         if r.status_code == 451:
@@ -362,38 +359,39 @@ def fetch_ohlcv(interval="1h", limit=300):
             df[c] = df[c].astype(float)
         return df[["open","high","low","close","volume"]]
     except Exception:
-        byi = _BYBIT_INTERVAL.get(interval, "60")
-        r2  = _req.get(BYBIT_KLINES, params={
-            "category": "spot", "symbol": SYMBOL,
-            "interval": byi, "limit": min(limit, 1000)
-        }, timeout=12)
+        import requests as _req
+        kri = _KRAKEN_INTERVAL.get(interval, 60)
+        r2  = _req.get(KRAKEN_OHLC, params={"pair": KRAKEN_PAIR, "interval": kri}, timeout=12)
         r2.raise_for_status()
-        rows = (r2.json().get("result") or {}).get("list") or []
-        return _parse_bybit_klines(rows)
+        res  = r2.json().get("result") or {}
+        rows = next((v for v in res.values() if isinstance(v, list)), [])
+        return _parse_kraken_ohlc(rows)
 
 
 def fetch_ticker():
     try:
-        r = HTTP_SESSION.get("https://api.binance.com/api/v3/ticker/24hr",
-                             params={"symbol": SYMBOL}, timeout=10)
+        r = HTTP_SESSION.get(BINANCE_TICKER, params={"symbol": SYMBOL}, timeout=10)
         if r.status_code == 451:
             raise Exception("geo-blocked")
         r.raise_for_status()
         return r.json()
     except Exception:
         import requests as _req
-        r2    = _req.get(BYBIT_TICKER, params={"category": "spot", "symbol": SYMBOL}, timeout=10)
+        r2    = _req.get(KRAKEN_TICKER, params={"pair": KRAKEN_PAIR}, timeout=10)
         r2.raise_for_status()
-        items = (r2.json().get("result") or {}).get("list") or [{}]
-        t     = items[0]
-        price = float(t.get("lastPrice") or 0)
-        chg   = float(t.get("price24hPcnt") or 0) * 100
+        t     = list((r2.json().get("result") or {}).values())[0]
+        price = float(t["c"][0])
+        high  = float(t["h"][1])
+        low   = float(t["l"][1])
+        vol   = float(t["v"][1])
+        open_ = float(t["o"])
+        chg   = round((price - open_) / open_ * 100, 4) if open_ else 0
         return {
             "symbol": SYMBOL, "lastPrice": str(price),
-            "priceChangePercent": str(round(chg, 4)),
-            "quoteVolume": str(float(t.get("volume24h") or 0)),
-            "highPrice": str(float(t.get("highPrice24h") or price)),
-            "lowPrice":  str(float(t.get("lowPrice24h")  or price)),
+            "priceChangePercent": str(chg),
+            "quoteVolume": str(vol),
+            "highPrice": str(high),
+            "lowPrice":  str(low),
         }
 
 
@@ -972,17 +970,18 @@ def safe_jsonify(obj, status_code: int = 200) -> JSONResponse:
 
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/24hr"
-BYBIT_KLINES   = "https://api.bybit.com/v5/market/kline"
-BYBIT_TICKER   = "https://api.bybit.com/v5/market/tickers"
+KRAKEN_OHLC    = "https://api.kraken.com/0/public/OHLC"
+KRAKEN_TICKER  = "https://api.kraken.com/0/public/Ticker"
+KRAKEN_PAIR    = "XBTUSD"
 
-# Mapping intervalle Binance → Bybit
-_BYBIT_INTERVAL = {
-    "1m": "1",  "3m": "3",  "5m": "5",  "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120","4h": "240","6h": "360",  "12h": "720",
-    "1d": "D",  "3d": "D",  "1w": "W",  "1M": "M",
+# Mapping intervalle Binance → Kraken (minutes)
+_KRAKEN_INTERVAL = {
+    "1m": 1,  "5m": 5,   "15m": 15,  "30m": 30,
+    "1h": 60, "2h": 60,  "4h": 240,  "6h": 240,
+    "12h": 240, "1d": 1440, "3d": 1440, "1w": 10080, "1M": 21600,
 }
 
-_binance_blocked: bool = False  # devient True dès qu'on détecte un 451
+_binance_blocked: bool = False
 
 
 def _parse_klines(raw: list) -> pd.DataFrame:
@@ -997,15 +996,14 @@ def _parse_klines(raw: list) -> pd.DataFrame:
     return df[["open","high","low","close","volume"]]
 
 
-def _parse_bybit_klines(raw: list) -> pd.DataFrame:
-    # Bybit retourne [startTime, open, high, low, close, volume, turnover] newest-first
-    rows = [[int(r[0]), float(r[1]), float(r[2]), float(r[3]),
-             float(r[4]), float(r[5])] for r in raw]
+def _parse_kraken_ohlc(raw: list) -> pd.DataFrame:
+    # Kraken: [time_s, open, high, low, close, vwap, volume, count]
+    rows = [[int(r[0]) * 1000, float(r[1]), float(r[2]), float(r[3]),
+             float(r[4]), float(r[6])] for r in raw]
     rows.sort(key=lambda x: x[0])
     df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp")
-    return df
+    return df.set_index("timestamp")
 
 
 async def _async_ohlcv(client: httpx.AsyncClient, interval: str, limit: int) -> pd.DataFrame:
@@ -1014,22 +1012,21 @@ async def _async_ohlcv(client: httpx.AsyncClient, interval: str, limit: int) -> 
         r = await client.get(BINANCE_KLINES,
                              params={"symbol": SYMBOL, "interval": interval, "limit": limit})
         if r.status_code == 451:
-            logger.warning("[fetch] Binance geo-bloqué (451) — bascule Bybit")
+            logger.warning("[fetch] Binance geo-bloqué (451) — bascule Kraken")
             _binance_blocked = True
         elif r.status_code == 200:
             return _parse_klines(r.json())
         else:
             r.raise_for_status()
 
-    # ── Fallback Bybit ──
-    byi = _BYBIT_INTERVAL.get(interval, "60")
-    r2 = await client.get(BYBIT_KLINES,
-                          params={"category": "spot", "symbol": SYMBOL,
-                                  "interval": byi, "limit": min(limit, 1000)})
+    # ── Fallback Kraken ──
+    kri = _KRAKEN_INTERVAL.get(interval, 60)
+    r2 = await client.get(KRAKEN_OHLC, params={"pair": KRAKEN_PAIR, "interval": kri})
     r2.raise_for_status()
     data = r2.json()
-    rows = (data.get("result") or {}).get("list") or []
-    return _parse_bybit_klines(rows)
+    result = data.get("result") or {}
+    rows = next((v for v in result.values() if isinstance(v, list)), [])
+    return _parse_kraken_ohlc(rows)
 
 
 async def _async_ticker(client: httpx.AsyncClient) -> dict:
@@ -1037,26 +1034,24 @@ async def _async_ticker(client: httpx.AsyncClient) -> dict:
     if not _binance_blocked:
         r = await client.get(BINANCE_TICKER, params={"symbol": SYMBOL})
         if r.status_code == 451:
-            logger.warning("[fetch] Binance ticker geo-bloqué (451) — bascule Bybit")
+            logger.warning("[fetch] Binance ticker geo-bloqué (451) — bascule Kraken")
             _binance_blocked = True
         elif r.status_code == 200:
             return r.json()
         else:
             r.raise_for_status()
 
-    # ── Fallback Bybit ticker ──
-    r2 = await client.get(BYBIT_TICKER,
-                          params={"category": "spot", "symbol": SYMBOL})
+    # ── Fallback Kraken ticker ──
+    r2 = await client.get(KRAKEN_TICKER, params={"pair": KRAKEN_PAIR})
     r2.raise_for_status()
     data  = r2.json()
-    items = (data.get("result") or {}).get("list") or [{}]
-    t     = items[0]
-    price = float(t.get("lastPrice") or 0)
-    chg   = float(t.get("price24hPcnt") or 0) * 100
-    vol   = float(t.get("volume24h") or 0)
-    high  = float(t.get("highPrice24h") or price)
-    low   = float(t.get("lowPrice24h")  or price)
-    # Convertit au format Binance attendu par le reste de l'app
+    t     = list((data.get("result") or {}).values())[0]
+    price = float(t["c"][0])
+    high  = float(t["h"][1])
+    low   = float(t["l"][1])
+    vol   = float(t["v"][1])
+    open_ = float(t["o"])
+    chg   = round((price - open_) / open_ * 100, 4) if open_ else 0
     return {
         "symbol":             SYMBOL,
         "lastPrice":          str(price),
