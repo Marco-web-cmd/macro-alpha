@@ -272,6 +272,19 @@ class SolanaBot:
         if mc > 0 and liq / mc < MIN_LIQ_MC_RATIO:
             return
 
+        # Score initial (sans données Helius)
+        score_basic = self._score(token_data)
+
+        # Enrichissement Helius si le token est prometteur (score ≥ 55 pour seuil bas)
+        if score_basic >= 55:
+            try:
+                from modules.helius_enrichment import enrich_token
+                s = await self._get_session()
+                enrichment = await enrich_token(mint, s)
+                token_data.update(enrichment)
+            except Exception:
+                pass
+
         score = self._score(token_data)
         if score < MIN_SCORE:
             log.info("stream_token_rejected", sym=sym, score=score,
@@ -298,7 +311,7 @@ class SolanaBot:
         await self._open_position(sym, token_data, price, amount, score, ctx)
 
     async def _dexscreener_token_data(self, mint: str) -> Optional[dict]:
-        """Récupère les données complètes d'un token depuis DexScreener."""
+        """Récupère les données complètes d'un token depuis DexScreener (inclut buys/sells)."""
         try:
             s = await self._get_session()
             async with s.get(
@@ -314,8 +327,9 @@ class SolanaBot:
             )
             if not pairs:
                 return None
-            p = pairs[0]
-            base = p.get("baseToken", {})
+            p       = pairs[0]
+            base    = p.get("baseToken", {})
+            txns_h1 = p.get("txns", {}).get("h1", {})
             return {
                 "symbol":                (base.get("symbol") or mint[:8]).upper(),
                 "address":               base.get("address") or mint,
@@ -324,6 +338,8 @@ class SolanaBot:
                 "v24hUSD":               float((p.get("volume") or {}).get("h24") or 0),
                 "mc":                    float(p.get("marketCap") or 0),
                 "liquidity":             float((p.get("liquidity") or {}).get("usd") or 0),
+                "buys_h1":               int(txns_h1.get("buys") or 0),
+                "sells_h1":              int(txns_h1.get("sells") or 0),
             }
         except Exception as e:
             log.warning("dexscreener_token_data_failed", mint=mint[:8], error=str(e))
@@ -649,11 +665,34 @@ class SolanaBot:
                 continue
 
             score = self._score(t)
-            if score >= MIN_SCORE:
+            if score >= 55:   # pré-sélection large avant enrichissement
                 scored.append((score, t))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        self._log("SCAN", f"✅ {len(scored)} qualifiés (score≥{MIN_SCORE}, liq/mc≥{MIN_LIQ_MC_RATIO:.0%})")
+
+        # ── Enrichissement Helius pour les top 10 candidats ──
+        # Ajoute holder_count + tx_5min via RPC Helius.
+        # On n'enrichit que les tokens qui passent déjà 55 pts pour limiter les appels.
+        try:
+            from modules.helius_enrichment import enrich_token
+            s = await self._get_session()
+            top_candidates = scored[:10]
+            enrichments = await asyncio.gather(
+                *[enrich_token(t.get("address", ""), s) for _, t in top_candidates],
+                return_exceptions=True,
+            )
+            for i, (sc, t) in enumerate(top_candidates):
+                if isinstance(enrichments[i], dict):
+                    t.update(enrichments[i])
+                    # Recalcule le score avec les nouvelles données
+                    scored[i] = (self._score(t), t)
+        except Exception as e:
+            log.warning("enrichment_step_failed", error=str(e))
+
+        # Filtre final au seuil MIN_SCORE après enrichissement
+        scored = [(s, t) for s, t in scored if s >= MIN_SCORE]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        self._log("SCAN", f"✅ {len(scored)} qualifiés après enrichissement (score≥{MIN_SCORE})")
 
         entered = 0
         for score, token in scored:
@@ -851,6 +890,11 @@ class SolanaBot:
             "agent_cycle_phase":  ctx.get("cycle_phase"),
             "agent_regime":       ctx.get("market_regime"),
             "agent_size_mult":    ctx.get("size_mult"),
+            # Signaux enrichis au moment de l'entrée
+            "entry_buys_h1":      token.get("buys_h1", 0),
+            "entry_sells_h1":     token.get("sells_h1", 0),
+            "entry_holders":      token.get("holder_count", 0),
+            "entry_tx_5min":      token.get("tx_5min", 0),
         }
 
         if not self.dry_run:
@@ -901,9 +945,16 @@ class SolanaBot:
             f"{ctx.get('cycle_phase', '?')} x{ctx.get('size_mult', 1)}"
             if ctx else ""
         )
+        buys    = token.get("buys_h1", 0)
+        sells   = token.get("sells_h1", 0)
+        holders = token.get("holder_count", 0)
+        tx5     = token.get("tx_5min", 0)
+        bs_str  = f"B/S {buys}/{sells}" if (buys or sells) else ""
+        en_str  = f"| {holders}h {tx5}tx/5m" if (holders or tx5) else ""
         self._log("BUY",
             f"[{mode}] {symbol} — {amount_usdc:.4f} {BASE_CURRENCY} @ ${price:.8f} | "
-            f"Score {score:.0f} | 24h {chg:+.1f}% | Capital {cap:.4f} {BASE_CURRENCY} "
+            f"Score {score:.0f} | 24h {chg:+.1f}% {bs_str}{en_str} "
+            f"| Capital {cap:.4f} {BASE_CURRENCY} "
             f"{macro_info} | SL ${pos['sl_price']:.8f}", symbol)
         return True
 
@@ -963,37 +1014,86 @@ class SolanaBot:
             f"| Capital→{cap:.4f} {BASE_CURRENCY}",
             pos["symbol"])
 
-    # ── Score ─────────────────────────────────────────────────
+    # ── Score enrichi ─────────────────────────────────────────
+    #
+    # Répartition (100 pts) :
+    #   Volume 24h        : 20 pts  — activité globale
+    #   Price change 24h  : 15 pts  — momentum directionnel
+    #   Market cap        : 15 pts  — potentiel de croissance
+    #   Liquidity         :  5 pts  — sécurité de sortie
+    #   Buy/sell ratio 1h : 25 pts  — pression acheteuse organique (signal le plus fort)
+    #   Holder count      : 10 pts  — distribution saine
+    #   Tx velocity 5min  : 10 pts  — momentum immédiat on-chain
+    #
 
     def _score(self, t) -> float:
-        v24h  = float(t.get("v24hUSD") or t.get("volume_24h") or 0)
-        chg   = float(t.get("priceChange24hPercent") or t.get("change_24h") or 0)
-        mc    = float(t.get("mc") or t.get("market_cap") or 0)
-        liq   = float(t.get("liquidity") or 0)
-        score = 0.0
+        v24h      = float(t.get("v24hUSD")               or t.get("volume_24h")  or 0)
+        chg       = float(t.get("priceChange24hPercent")  or t.get("change_24h")  or 0)
+        mc        = float(t.get("mc")                     or t.get("market_cap")  or 0)
+        liq       = float(t.get("liquidity")              or 0)
+        buys_h1   = int(t.get("buys_h1")   or 0)
+        sells_h1  = int(t.get("sells_h1")  or 0)
+        holders   = int(t.get("holder_count") or 0)
+        tx_5min   = int(t.get("tx_5min")    or 0)
+        score     = 0.0
 
-        if   v24h >= 5_000_000:  score += 25
-        elif v24h >= 1_000_000:  score += 30
-        elif v24h >= 300_000:    score += 22
-        elif v24h >= 100_000:    score += 14
-        elif v24h >= 30_000:     score += 6
+        # ── Volume 24h (20 pts) ──
+        if   v24h >= 5_000_000:  score += 20
+        elif v24h >= 1_000_000:  score += 18
+        elif v24h >= 300_000:    score += 14
+        elif v24h >= 100_000:    score += 9
+        elif v24h >= 30_000:     score += 4
 
-        if   5 <= chg < 20:      score += 30
-        elif 20 <= chg < 50:     score += 22
-        elif 2 <= chg < 5:       score += 15
-        elif 50 <= chg < 100:    score += 12
-        elif -3 <= chg < 2:      score += 5
+        # ── Price change 24h (15 pts) ──
+        # Zone idéale : +5/+20% — momentum sain sans euphorie
+        if   5 <= chg < 20:      score += 15
+        elif 2 <= chg < 5:       score += 12
+        elif 20 <= chg < 50:     score += 8
+        elif -3 <= chg < 2:      score += 4
+        elif 50 <= chg < 100:    score += 4   # suracheté — risque retrace
 
-        if   0 < mc < 2_000_000: score += 25
-        elif mc < 10_000_000:    score += 22
-        elif mc < 30_000_000:    score += 18
-        elif mc < 100_000_000:   score += 10
-        elif mc < 300_000_000:   score += 4
+        # ── Market cap (15 pts) ──
+        if   0 < mc < 2_000_000: score += 15
+        elif mc < 10_000_000:    score += 12
+        elif mc < 30_000_000:    score += 8
+        elif mc < 100_000_000:   score += 4
 
-        if   liq >= 1_000_000:   score += 15
-        elif liq >= 300_000:     score += 12
-        elif liq >= 100_000:     score += 8
-        elif liq >= 30_000:      score += 4
+        # ── Liquidity (5 pts) ──
+        if   liq >= 500_000:     score += 5
+        elif liq >= 100_000:     score += 4
+        elif liq >= 50_000:      score += 3
+        elif liq >= 20_000:      score += 1
+
+        # ── Buy/sell ratio 1h (25 pts) — signal le plus prédictif ──
+        # Données absentes → score neutre (10 pts) pour ne pas pénaliser Birdeye
+        if buys_h1 == 0 and sells_h1 == 0:
+            score += 10   # neutre : absence de données ≠ mauvais signal
+        else:
+            ratio = buys_h1 / max(1, sells_h1)
+            if   ratio >= 3.0: score += 25   # forte pression acheteuse
+            elif ratio >= 2.0: score += 20
+            elif ratio >= 1.5: score += 15
+            elif ratio >= 1.2: score += 10
+            elif ratio >= 0.9: score += 4    # équilibré
+            # ratio < 0.9 : pression vendeuse dominante → +0
+
+        # ── Holder count (10 pts) ──
+        if holders == 0:
+            score += 5    # neutre si non enrichi
+        elif holders >= 500: score += 10
+        elif holders >= 200: score += 8
+        elif holders >= 100: score += 6
+        elif holders >= 50:  score += 4
+        elif holders >= 20:  score += 2
+
+        # ── Transaction velocity 5min (10 pts) ──
+        if tx_5min == 0:
+            score += 5    # neutre si non enrichi
+        elif tx_5min >= 100: score += 10
+        elif tx_5min >= 50:  score += 8
+        elif tx_5min >= 20:  score += 5
+        elif tx_5min >= 10:  score += 3
+        elif tx_5min >= 3:   score += 1
 
         return min(100.0, score)
 
@@ -1027,9 +1127,16 @@ class SolanaBot:
                 d = await r.json()
             tokens = d.get("data", {}).get("tokens", [])
             skip = {"USDC", "USDT", "BUSD", "DAI", "USDS", "SOL", "WSOL"}
-            return [t for t in tokens
-                    if t.get("symbol", "").upper() not in skip
-                    and float(t.get("mc") or 0) < 300_000_000]
+            normalized = []
+            for t in tokens:
+                if t.get("symbol", "").upper() in skip:
+                    continue
+                if float(t.get("mc") or 0) >= 300_000_000:
+                    continue
+                t.setdefault("buys_h1", 0)
+                t.setdefault("sells_h1", 0)
+                normalized.append(t)
+            return normalized
         except Exception as e:
             log.warning("birdeye_tokens_failed", error=str(e))
             return []
@@ -1056,6 +1163,7 @@ class SolanaBot:
                     if not pairs:
                         continue
                     p = pairs[0]
+                    txns_h1 = p.get("txns", {}).get("h1", {})
                     results.append({
                         "symbol":                p.get("baseToken", {}).get("symbol", ""),
                         "address":               mint,
@@ -1064,6 +1172,9 @@ class SolanaBot:
                         "v24hUSD":               float(p.get("volume", {}).get("h24") or 0),
                         "mc":                    float(p.get("marketCap") or 0),
                         "liquidity":             float((p.get("liquidity") or {}).get("usd") or 0),
+                        # ── Nouveaux signaux on-chain depuis DexScreener ──
+                        "buys_h1":               int(txns_h1.get("buys") or 0),
+                        "sells_h1":              int(txns_h1.get("sells") or 0),
                     })
                     await asyncio.sleep(0.2)
                 except Exception:
