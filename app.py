@@ -342,27 +342,59 @@ def _sanitize(obj):
 
 # ── Binance ──
 def fetch_ohlcv(interval="1h", limit=300):
-    url = "https://api.binance.com/api/v3/klines"
-    r   = HTTP_SESSION.get(url, params={
-        "symbol": SYMBOL, "interval": interval, "limit": limit
-    }, timeout=10)
-    r.raise_for_status()
-    df = pd.DataFrame(r.json(), columns=[
-        "timestamp","open","high","low","close","volume",
-        "ct","qav","nt","tbb","tbq","ignore"
-    ])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.set_index("timestamp")
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
-    return df[["open","high","low","close","volume"]]
+    import requests as _req
+    # Essaie Binance ; bascule Bybit si bloqué
+    try:
+        url = "https://api.binance.com/api/v3/klines"
+        r   = HTTP_SESSION.get(url, params={
+            "symbol": SYMBOL, "interval": interval, "limit": limit
+        }, timeout=10)
+        if r.status_code == 451:
+            raise Exception("geo-blocked")
+        r.raise_for_status()
+        df = pd.DataFrame(r.json(), columns=[
+            "timestamp","open","high","low","close","volume",
+            "ct","qav","nt","tbb","tbq","ignore"
+        ])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        df = df.set_index("timestamp")
+        for c in ["open","high","low","close","volume"]:
+            df[c] = df[c].astype(float)
+        return df[["open","high","low","close","volume"]]
+    except Exception:
+        byi = _BYBIT_INTERVAL.get(interval, "60")
+        r2  = _req.get(BYBIT_KLINES, params={
+            "category": "spot", "symbol": SYMBOL,
+            "interval": byi, "limit": min(limit, 1000)
+        }, timeout=12)
+        r2.raise_for_status()
+        rows = (r2.json().get("result") or {}).get("list") or []
+        return _parse_bybit_klines(rows)
 
 
 def fetch_ticker():
-    r = HTTP_SESSION.get("https://api.binance.com/api/v3/ticker/24hr",
-                         params={"symbol": SYMBOL}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    try:
+        r = HTTP_SESSION.get("https://api.binance.com/api/v3/ticker/24hr",
+                             params={"symbol": SYMBOL}, timeout=10)
+        if r.status_code == 451:
+            raise Exception("geo-blocked")
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        import requests as _req
+        r2    = _req.get(BYBIT_TICKER, params={"category": "spot", "symbol": SYMBOL}, timeout=10)
+        r2.raise_for_status()
+        items = (r2.json().get("result") or {}).get("list") or [{}]
+        t     = items[0]
+        price = float(t.get("lastPrice") or 0)
+        chg   = float(t.get("price24hPcnt") or 0) * 100
+        return {
+            "symbol": SYMBOL, "lastPrice": str(price),
+            "priceChangePercent": str(round(chg, 4)),
+            "quoteVolume": str(float(t.get("volume24h") or 0)),
+            "highPrice": str(float(t.get("highPrice24h") or price)),
+            "lowPrice":  str(float(t.get("lowPrice24h")  or price)),
+        }
 
 
 # ── Modèles IA (instances globales) ──
@@ -940,6 +972,18 @@ def safe_jsonify(obj, status_code: int = 200) -> JSONResponse:
 
 BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
 BINANCE_TICKER = "https://api.binance.com/api/v3/ticker/24hr"
+BYBIT_KLINES   = "https://api.bybit.com/v5/market/kline"
+BYBIT_TICKER   = "https://api.bybit.com/v5/market/tickers"
+
+# Mapping intervalle Binance → Bybit
+_BYBIT_INTERVAL = {
+    "1m": "1",  "3m": "3",  "5m": "5",  "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120","4h": "240","6h": "360",  "12h": "720",
+    "1d": "D",  "3d": "D",  "1w": "W",  "1M": "M",
+}
+
+_binance_blocked: bool = False  # devient True dès qu'on détecte un 451
+
 
 def _parse_klines(raw: list) -> pd.DataFrame:
     df = pd.DataFrame(raw, columns=[
@@ -952,24 +996,84 @@ def _parse_klines(raw: list) -> pd.DataFrame:
         df[c] = df[c].astype(float)
     return df[["open","high","low","close","volume"]]
 
+
+def _parse_bybit_klines(raw: list) -> pd.DataFrame:
+    # Bybit retourne [startTime, open, high, low, close, volume, turnover] newest-first
+    rows = [[int(r[0]), float(r[1]), float(r[2]), float(r[3]),
+             float(r[4]), float(r[5])] for r in raw]
+    rows.sort(key=lambda x: x[0])
+    df = pd.DataFrame(rows, columns=["timestamp","open","high","low","close","volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df = df.set_index("timestamp")
+    return df
+
+
 async def _async_ohlcv(client: httpx.AsyncClient, interval: str, limit: int) -> pd.DataFrame:
-    r = await client.get(BINANCE_KLINES, params={"symbol": SYMBOL, "interval": interval, "limit": limit})
-    r.raise_for_status()
-    return _parse_klines(r.json())
+    global _binance_blocked
+    if not _binance_blocked:
+        r = await client.get(BINANCE_KLINES,
+                             params={"symbol": SYMBOL, "interval": interval, "limit": limit})
+        if r.status_code == 451:
+            logger.warning("[fetch] Binance geo-bloqué (451) — bascule Bybit")
+            _binance_blocked = True
+        elif r.status_code == 200:
+            return _parse_klines(r.json())
+        else:
+            r.raise_for_status()
+
+    # ── Fallback Bybit ──
+    byi = _BYBIT_INTERVAL.get(interval, "60")
+    r2 = await client.get(BYBIT_KLINES,
+                          params={"category": "spot", "symbol": SYMBOL,
+                                  "interval": byi, "limit": min(limit, 1000)})
+    r2.raise_for_status()
+    data = r2.json()
+    rows = (data.get("result") or {}).get("list") or []
+    return _parse_bybit_klines(rows)
+
 
 async def _async_ticker(client: httpx.AsyncClient) -> dict:
-    r = await client.get(BINANCE_TICKER, params={"symbol": SYMBOL})
-    r.raise_for_status()
-    return r.json()
+    global _binance_blocked
+    if not _binance_blocked:
+        r = await client.get(BINANCE_TICKER, params={"symbol": SYMBOL})
+        if r.status_code == 451:
+            logger.warning("[fetch] Binance ticker geo-bloqué (451) — bascule Bybit")
+            _binance_blocked = True
+        elif r.status_code == 200:
+            return r.json()
+        else:
+            r.raise_for_status()
+
+    # ── Fallback Bybit ticker ──
+    r2 = await client.get(BYBIT_TICKER,
+                          params={"category": "spot", "symbol": SYMBOL})
+    r2.raise_for_status()
+    data  = r2.json()
+    items = (data.get("result") or {}).get("list") or [{}]
+    t     = items[0]
+    price = float(t.get("lastPrice") or 0)
+    chg   = float(t.get("price24hPcnt") or 0) * 100
+    vol   = float(t.get("volume24h") or 0)
+    high  = float(t.get("highPrice24h") or price)
+    low   = float(t.get("lowPrice24h")  or price)
+    # Convertit au format Binance attendu par le reste de l'app
+    return {
+        "symbol":             SYMBOL,
+        "lastPrice":          str(price),
+        "priceChangePercent": str(round(chg, 4)),
+        "quoteVolume":        str(vol),
+        "highPrice":          str(high),
+        "lowPrice":           str(low),
+    }
+
 
 async def fetch_all_parallel(interval: str, chart_limit: int = 500,
                               daily_limit: int = 730) -> tuple:
     """
-    Lance toutes les requêtes Binance en parallèle.
+    Lance toutes les requêtes en parallèle (Binance → Bybit fallback si 451).
     Retourne (df, ticker, df_daily, df_weekly, df_monthly).
-    Avant (séquentiel) : ~3s. Après (parallèle) : ~0.8s.
     """
-    async with httpx.AsyncClient(timeout=10) as client:
+    async with httpx.AsyncClient(timeout=12) as client:
         tasks = [
             _async_ohlcv(client, interval, chart_limit),   # 0: df principal
             _async_ticker(client),                          # 1: ticker
