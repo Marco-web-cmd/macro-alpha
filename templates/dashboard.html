@@ -974,6 +974,9 @@ html, body { height: 100%; background: var(--bg); color: var(--text);
             <span class="bot-section-title" style="margin:0">📊 Positions ouvertes</span>
             <button onclick="loadBotStatus()" class="btn" style="padding:2px 8px;font-size:7px">↺ Refresh</button>
           </div>
+          <div id="bot-api-debug" style="font-size:7px;color:var(--text3);padding:4px 8px;background:var(--bg3);border-radius:3px;margin-bottom:6px;font-family:monospace">
+            En attente des données…
+          </div>
           <div id="bot-positions">
             <div style="font-size:8px;color:var(--text3);text-align:center;padding:20px">
               Aucune position — démarrez le bot pour qu'il scanne automatiquement
@@ -2319,6 +2322,16 @@ function _applyBotData(d) {
     _botRunning  = d.running;
     _botCurrency = d.base_currency || 'SOL';
     const cur    = _botCurrency;
+
+    // Debug panel — montre ce que le JS reçoit réellement
+    const dbg = document.getElementById('bot-api-debug');
+    if (dbg) {
+        const ts = new Date().toLocaleTimeString('fr', {hour:'2-digit', minute:'2-digit', second:'2-digit'});
+        const allPos = d.positions || [];
+        const openCount = allPos.filter(p => p.status === 'open').length;
+        dbg.textContent = `API reçu à ${ts} — ${openCount} open / ${allPos.length} total — capital ${(+d.total_capital||0).toFixed(4)} SOL`;
+        dbg.style.color = openCount > 0 ? 'var(--bull)' : 'var(--text3)';
+    }
 
     // Dot + texte
     const dot = document.getElementById('bot-dot');
