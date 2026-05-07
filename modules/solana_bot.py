@@ -866,7 +866,7 @@ class SolanaBot:
         results = []
         for pos, mint in mints:
             try:
-                p = await self._fetch_price_dex(mint) if mint else None
+                p = await self._fetch_price_dex(mint, min_liq=0) if mint else None
                 if not p:
                     p = await self._fetch_price_birdeye(mint) if mint else None
                 results.append((pos, p))
@@ -1313,7 +1313,7 @@ class SolanaBot:
             log.warning("dexscreener_failed", error=str(e))
             return []
 
-    async def _fetch_price_dex(self, mint: str) -> Optional[float]:
+    async def _fetch_price_dex(self, mint: str, min_liq: float = 10_000) -> Optional[float]:
         if not mint:
             return None
         try:
@@ -1327,7 +1327,7 @@ class SolanaBot:
             raw_pairs = d.get("pairs") or []
             pairs = sorted(
                 [p for p in raw_pairs
-                 if float((p.get("liquidity") or {}).get("usd") or 0) > 10_000],
+                 if float((p.get("liquidity") or {}).get("usd") or 0) >= min_liq],
                 key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
                 reverse=True,
             )
@@ -1342,14 +1342,26 @@ class SolanaBot:
         if not mint or not self.birdeye_key:
             return None
         try:
+            import time as _time
             s = await self._get_session()
             async with s.get(
                 f"https://public-api.birdeye.so/defi/price?address={mint}",
                 headers={"X-API-KEY": self.birdeye_key, "x-chain": "solana"},
             ) as r:
                 d = await r.json()
-            v = d.get("data", {}).get("value")
-            return float(v) if v else None
+            data = d.get("data") or {}
+            v = data.get("value")
+            if not v:
+                return None
+            # Reject stale Birdeye data: price frozen >4h + 0% change = cached dead price
+            update_ts = data.get("updateUnixTime", 0)
+            change_24h = data.get("priceChange24h", None)
+            if (update_ts and change_24h == 0
+                    and _time.time() - update_ts > 4 * 3600):
+                log.warning("birdeye_stale_price", mint=mint[:8],
+                            hours_old=round((_time.time() - update_ts) / 3600, 1))
+                return None
+            return float(v)
         except Exception as e:
             log.warning("birdeye_price_failed", mint=mint[:8], error=str(e))
         return None
