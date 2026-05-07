@@ -22,14 +22,74 @@ ANOMALY_THRESHOLDS = {
 }
 
 
+async def _fetch_top50_coingecko() -> list:
+    """
+    Fallback CoinGecko — pas geo-bloqué.
+    Convertit au format Binance {symbol, quoteVolume, priceChangePercent, lastPrice, highPrice, lowPrice}.
+    """
+    url = (
+        "https://api.coingecko.com/api/v3/coins/markets"
+        "?vs_currency=usd&order=volume_desc&per_page=50&page=1"
+        "&sparkline=false&price_change_percentage=24h"
+    )
+    async with httpx.AsyncClient(timeout=12) as client:
+        r = await client.get(url, headers={"Accept": "application/json"})
+    if r.status_code != 200:
+        logger.warning("[Screener] CoinGecko HTTP %s", r.status_code)
+        return []
+    coins = r.json()
+    if not isinstance(coins, list):
+        return []
+
+    result = []
+    for c in coins:
+        symbol = (c.get("symbol") or "").upper() + "USDT"
+        price  = float(c.get("current_price") or 0)
+        high   = float(c.get("high_24h") or price)
+        low    = float(c.get("low_24h")  or price)
+        vol    = float(c.get("total_volume") or 0)
+        chg    = float(c.get("price_change_percentage_24h") or 0)
+        if vol < 1_000_000:
+            continue
+        result.append({
+            "symbol":             symbol,
+            "lastPrice":          str(price),
+            "highPrice":          str(high),
+            "lowPrice":           str(low),
+            "quoteVolume":        str(vol),
+            "priceChangePercent": str(chg),
+        })
+    logger.info("[Screener] CoinGecko fallback — %d coins", len(result))
+    return result[:50]
+
+
 async def fetch_top50_binance() -> list:
     """
     Récupère le top 50 des paires USDT par volume (24H).
     Endpoint : /ticker/24hr (snapshot complet).
+    Fallback vers CoinGecko si Binance est geo-bloqué (HTTP 451) ou indisponible.
     """
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get("https://api.binance.com/api/v3/ticker/24hr")
-    tickers = r.json()
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("https://api.binance.com/api/v3/ticker/24hr")
+
+        if r.status_code == 451:
+            logger.warning("[Screener] Binance geo-bloqué (451) — bascule CoinGecko")
+            return await _fetch_top50_coingecko()
+
+        if r.status_code != 200:
+            logger.warning("[Screener] Binance HTTP %s — bascule CoinGecko", r.status_code)
+            return await _fetch_top50_coingecko()
+
+        tickers = r.json()
+        if not isinstance(tickers, list):
+            logger.warning("[Screener] Binance réponse inattendue (%s) — bascule CoinGecko",
+                           type(tickers).__name__)
+            return await _fetch_top50_coingecko()
+
+    except Exception as e:
+        logger.warning("[Screener] Binance indisponible (%s) — bascule CoinGecko", e)
+        return await _fetch_top50_coingecko()
 
     usdt = [
         t for t in tickers
@@ -37,7 +97,7 @@ async def fetch_top50_binance() -> list:
         and float(t.get("quoteVolume", 0)) > 1_000_000
     ]
     usdt.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-    logger.info("[Screener] %d paires USDT qualifiées", len(usdt))
+    logger.info("[Screener] %d paires USDT qualifiées (Binance)", len(usdt))
     return usdt[:50]
 
 
