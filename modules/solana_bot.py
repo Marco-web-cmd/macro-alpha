@@ -77,10 +77,11 @@ class SolanaBot:
 
     def __init__(self):
         self.dry_run      = os.getenv("DRY_RUN", "true").lower() == "true"
-        self.running      = False
-        self._scan_task   = None
-        self._mon_task    = None
-        self._stream_task = None
+        self.running       = False
+        self._scan_task    = None
+        self._mon_task     = None
+        self._stream_task  = None
+        self._wallet_task  = None
         self._session: Optional[aiohttp.ClientSession] = None
         self.birdeye_key  = os.getenv("BIRDEYE_API_KEY", "")
         os.makedirs("data", exist_ok=True)
@@ -133,16 +134,18 @@ class SolanaBot:
         self._scan_task   = asyncio.create_task(self._scan_loop())
         self._mon_task    = asyncio.create_task(self._monitor_loop())
         self._stream_task = asyncio.create_task(self._start_stream())
+        self._wallet_task = asyncio.create_task(self._start_wallet_tracker())
         cap  = self._total_capital()
         mode = "PAPER" if self.dry_run else "LIVE"
         self._log("BOT_START",
             f"Mode {mode} — capital {INITIAL_CAPITAL} {BASE_CURRENCY} "
             f"| total {cap} {BASE_CURRENCY}")
-        return {"ok": True, "msg": "Bot démarré — scan + monitor + stream WebSocket actifs"}
+        return {"ok": True, "msg": "Bot démarré — scan + monitor + stream + copy trading actifs"}
 
     async def stop(self) -> dict:
         self.running = False
-        for t in [self._scan_task, self._mon_task, self._stream_task]:
+        for t in [self._scan_task, self._mon_task,
+                  self._stream_task, self._wallet_task]:
             if t and not t.done():
                 t.cancel()
         await self.close()
@@ -308,6 +311,117 @@ class SolanaBot:
         self._log("STREAM",
             f"⚡ [{source.upper()}] {sym} détecté — score {score:.0f} — entrée {amount:.4f} SOL",
             sym)
+        await self._open_position(sym, token_data, price, amount, score, ctx)
+
+    # ── Copy trading — Smart Money ────────────────────────────
+
+    async def _start_wallet_tracker(self):
+        """Lance le suivi des wallets smart money configurés dans .env."""
+        try:
+            from modules.smart_money import SmartMoneyTracker
+            self._smart_money = SmartMoneyTracker()
+            if self._smart_money.wallet_count == 0:
+                log.info("smart_money_no_wallets",
+                         hint="Ajoute SMART_MONEY_WALLETS=addr1:label1,addr2 dans .env")
+                return
+            await self._smart_money.start(self._on_wallet_buy)
+        except Exception as e:
+            log.warning("wallet_tracker_start_failed", error=str(e))
+
+    async def _on_wallet_buy(self, event: dict):
+        """
+        Callback appelé quand un wallet smart money achète un token.
+        Passe le token par le même pipeline que le stream :
+          DexScreener → scoring enrichi → preflight → entrée.
+        """
+        if not self.running:
+            return
+
+        mint         = event.get("mint", "")
+        wallet_label = event.get("wallet_label", "?")
+        sol_spent    = event.get("sol_spent", 0)
+
+        # Vérifie les slots et le capital disponible
+        positions = self._load_positions()
+        open_pos  = [p for p in positions if p["status"] == "open"]
+        slots     = MAX_POSITIONS - len(open_pos)
+        if slots <= 0:
+            return
+
+        ctx       = self._agent_context()
+        size_mult = ctx["size_mult"]
+        if size_mult == 0.0:
+            return
+
+        total_cap = self._total_capital()
+        available = total_cap - self._invested_capital()
+        if available < MIN_POSITION:
+            return
+
+        # Cooldown : pas plus d'1 entrée copy toutes les 15s
+        now = asyncio.get_event_loop().time()
+        if now - getattr(self, "_last_copy_trade", 0) < 15:
+            return
+
+        # Récupère les données du token
+        token_data = await self._dexscreener_token_data(mint)
+        if not token_data:
+            log.info("copy_no_dex_data", mint=mint[:8], wallet=wallet_label)
+            return
+
+        sym = token_data.get("symbol", mint[:8]).upper()
+        if sym in {p["symbol"] for p in open_pos}:
+            return
+
+        liq = float(token_data.get("liquidity") or 0)
+        mc  = float(token_data.get("mc") or 0)
+        if liq < MIN_LIQ_USD:
+            return
+        if mc > 0 and liq / mc < MIN_LIQ_MC_RATIO:
+            return
+
+        # Score initial + enrichissement Helius
+        score_basic = self._score(token_data)
+        if score_basic >= 45:   # seuil bas pour copy : on fait confiance au wallet
+            try:
+                from modules.helius_enrichment import enrich_token
+                s = await self._get_session()
+                enrichment = await enrich_token(mint, s)
+                token_data.update(enrichment)
+            except Exception:
+                pass
+
+        score = self._score(token_data)
+
+        # Pour le copy trading on accepte un score plus bas (55 vs 70)
+        # Le signal "smart money" compense le score manquant
+        COPY_MIN_SCORE = 55
+        if score < COPY_MIN_SCORE:
+            log.info("copy_token_rejected", sym=sym, score=score,
+                     wallet=wallet_label)
+            return
+
+        price = float(token_data.get("price") or 0)
+        if not price:
+            return
+
+        pf = await self._preflight_check(mint, sym)
+        if not pf["ok"]:
+            return
+
+        amount = self._position_size(score, available, slots, total_cap)
+        amount = round(amount * size_mult, 4)
+        if amount < MIN_POSITION:
+            return
+
+        self._last_copy_trade = now  # type: ignore[attr-defined]
+        self._log("COPY",
+            f"🧠 [{wallet_label}] {sym} copié — {sol_spent:.3f} SOL dépensés "
+            f"— score {score:.0f} — entrée {amount:.4f} SOL", sym)
+
+        # Marque le token comme "copy trade" dans les données
+        token_data["copy_wallet"]       = event.get("wallet", "")
+        token_data["copy_wallet_label"] = wallet_label
         await self._open_position(sym, token_data, price, amount, score, ctx)
 
     async def _dexscreener_token_data(self, mint: str) -> Optional[dict]:
@@ -895,6 +1009,9 @@ class SolanaBot:
             "entry_sells_h1":     token.get("sells_h1", 0),
             "entry_holders":      token.get("holder_count", 0),
             "entry_tx_5min":      token.get("tx_5min", 0),
+            # Copy trading
+            "copy_wallet":        token.get("copy_wallet", ""),
+            "copy_wallet_label":  token.get("copy_wallet_label", ""),
         }
 
         if not self.dry_run:
