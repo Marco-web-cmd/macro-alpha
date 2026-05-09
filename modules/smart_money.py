@@ -111,7 +111,7 @@ class SmartMoneyTracker:
         try:
             async with session.get(
                 "https://public-api.birdeye.so/trader/gainers-losers"
-                "?time_frame=7d&sort_by=PnL&sort_type=desc&limit=50",
+                "?time_frame=7D&sort_by=PnL&sort_type=desc&limit=10",
                 headers={"X-API-KEY": BIRDEYE_KEY, "x-chain": "solana"},
             ) as r:
                 if r.status != 200:
