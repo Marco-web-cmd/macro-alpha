@@ -16,11 +16,10 @@ import structlog
 log = structlog.get_logger()
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "")
-# URLs WebSocket par priorité — bascule automatique si quota Helius épuisé
+# URLs WebSocket — rotation automatique sur 429
 _WS_URLS = [
     f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
-    "wss://api.mainnet-beta.solana.com",       # RPC public officiel Solana (gratuit)
-    "wss://solana-mainnet.g.alchemy.com/v2/demo",  # Alchemy demo (gratuit, limité)
+    "wss://api.mainnet-beta.solana.com",   # RPC public officiel Solana Foundation
 ]
 
 RAYDIUM_AMM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
@@ -188,11 +187,14 @@ class TokenStream:
             except Exception as e:
                 if self._running:
                     err_str = str(e)
-                    # 429 = quota Helius épuisé → bascule sur URL suivante
-                    if "429" in err_str and url_idx < len(_WS_URLS) - 1:
-                        url_idx += 1
+                    if "429" in err_str:
+                        # Quota épuisé → bascule sur l'URL suivante (rotation infinie)
+                        url_idx = (url_idx + 1) % len(_WS_URLS)
+                        next_url = _WS_URLS[url_idx]
                         log.warning("ws_fallback", source=source,
-                                    new_url=_WS_URLS[url_idx][:40])
+                                    next_url=next_url[:50])
+                        # Petite pause avant de réessayer sur le nouvel endpoint
+                        await asyncio.sleep(3)
                         reconnect_delay = 2
                     else:
                         log.warning("ws_reconnecting", source=source,
