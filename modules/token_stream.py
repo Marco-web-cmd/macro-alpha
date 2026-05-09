@@ -16,7 +16,12 @@ import structlog
 log = structlog.get_logger()
 
 HELIUS_KEY = os.getenv("HELIUS_API_KEY", "")
-WS_URL     = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+# URLs WebSocket par priorité — bascule automatique si quota Helius épuisé
+_WS_URLS = [
+    f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}",
+    "wss://api.mainnet-beta.solana.com",       # RPC public officiel Solana (gratuit)
+    "wss://solana-mainnet.g.alchemy.com/v2/demo",  # Alchemy demo (gratuit, limité)
+]
 
 RAYDIUM_AMM  = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 PUMPFUN      = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
@@ -146,11 +151,13 @@ class TokenStream:
     async def _subscribe(self, program: str, init_kw: str, source: str):
         import websockets
         reconnect_delay = 2
+        url_idx = 0  # commence par Helius, bascule si 429
 
         while self._running:
+            ws_url = _WS_URLS[url_idx % len(_WS_URLS)]
             try:
                 async with websockets.connect(
-                    WS_URL,
+                    ws_url,
                     ping_interval=20,
                     ping_timeout=30,
                     close_timeout=5,
@@ -165,7 +172,7 @@ class TokenStream:
                         ],
                     }))
                     reconnect_delay = 2
-                    log.info("ws_connected", source=source)
+                    log.info("ws_connected", source=source, url=ws_url[:40])
 
                     async for raw in ws:
                         if not self._running:
@@ -180,10 +187,18 @@ class TokenStream:
                 return
             except Exception as e:
                 if self._running:
-                    log.warning("ws_reconnecting", source=source,
-                                error=str(e), wait=reconnect_delay)
-                    await asyncio.sleep(reconnect_delay)
-                    reconnect_delay = min(reconnect_delay * 2, 60)
+                    err_str = str(e)
+                    # 429 = quota Helius épuisé → bascule sur URL suivante
+                    if "429" in err_str and url_idx < len(_WS_URLS) - 1:
+                        url_idx += 1
+                        log.warning("ws_fallback", source=source,
+                                    new_url=_WS_URLS[url_idx][:40])
+                        reconnect_delay = 2
+                    else:
+                        log.warning("ws_reconnecting", source=source,
+                                    error=err_str, wait=reconnect_delay)
+                        await asyncio.sleep(reconnect_delay)
+                        reconnect_delay = min(reconnect_delay * 2, 60)
 
     async def _handle(self, msg: dict, init_kw: str, source: str):
         params = msg.get("params")
