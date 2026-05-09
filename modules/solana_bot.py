@@ -33,7 +33,7 @@ MIN_SCORE_COPY    = 40      # seuil réduit pour copy trades (wallet = signal de
 MIN_LIQ_MC_RATIO  = 0.02
 MIN_LIQ_USD       = 20 * 150.0
 SCAN_INTERVAL     = 5 * 60  # 5 min (était 30 min — memecoins vivent 15-45 min)
-MONITOR_INTERVAL  = 2 * 60
+MONITOR_INTERVAL  = 30          # 30s (était 2min) — détecte les rugs plus vite
 JUPITER_MAX_RETRY = 3
 TIME_STOP_MINUTES = 20      # ferme si pas de mouvement après 20 min
 TIME_STOP_MIN_MOVE_PCT = 3.0  # mouvement minimal requis pour ne pas déclencher le time-stop
@@ -840,10 +840,11 @@ class SolanaBot:
         results = []
         for pos, mint in mints:
             try:
-                p = await self._fetch_price_dex(mint, min_liq=0) if mint else None
+                p, liq = await self._fetch_price_and_liq_dex(mint) if mint else (None, 0.0)
                 if not p:
-                    p = await self._fetch_price_birdeye(mint) if mint else None
-                results.append((pos, p))
+                    p    = await self._fetch_price_birdeye(mint) if mint else None
+                    liq  = 0.0
+                results.append((pos, p, liq))
             except Exception as e:
                 results.append(e)
             await asyncio.sleep(0.8)  # 0.8s entre chaque appel
@@ -854,7 +855,7 @@ class SolanaBot:
             if isinstance(res, Exception):
                 failed += 1
                 continue
-            pos, price = res
+            pos, price, current_liq = res
             sym = pos["symbol"]
 
             if not price:
@@ -907,6 +908,17 @@ class SolanaBot:
                 "price_miss_count": 0,  # reset dès qu'on a un prix
             })
             updated += 1
+
+            # ── Anti-rug : chute de liquidité > 70% depuis l'entrée → exit immédiat ──
+            entry_liq = pos.get("entry_liquidity_usd", 0)
+            if entry_liq > 0 and current_liq > 0 and current_liq < entry_liq * 0.30:
+                self._log("RUG_DETECT",
+                    f"🚨 {sym} — liquidité effondrée "
+                    f"(${current_liq:,.0f} vs ${entry_liq:,.0f} entrée, "
+                    f"-{(1 - current_liq/entry_liq)*100:.0f}%) → exit immédiat", sym)
+                await self._partial_close(pos, price, "RUG_DETECT",
+                                          pos.get("remaining_fraction", 1.0), positions)
+                continue
 
             # ── Time-stop : ferme si pas de mouvement après TIME_STOP_MINUTES ──
             opened_at  = pos.get("opened_at")
@@ -1028,6 +1040,8 @@ class SolanaBot:
             # Copy trading
             "copy_wallet":        token.get("copy_wallet", ""),
             "copy_wallet_label":  token.get("copy_wallet_label", ""),
+            # Liquidité à l'entrée — sert à détecter les rugs (chute > 70%)
+            "entry_liquidity_usd": float(token.get("liquidity") or 0),
         }
 
         if not self.dry_run:
@@ -1316,6 +1330,32 @@ class SolanaBot:
         except Exception as e:
             log.warning("dexscreener_failed", error=str(e))
             return []
+
+    async def _fetch_price_and_liq_dex(self, mint: str) -> tuple:
+        """Retourne (price: float|None, liq_usd: float) depuis DexScreener."""
+        if not mint:
+            return None, 0.0
+        try:
+            s = await self._get_session()
+            async with s.get(
+                f"https://api.dexscreener.com/latest/dex/tokens/{mint}"
+            ) as r:
+                d = await r.json()
+            if not d or not isinstance(d, dict):
+                return None, 0.0
+            pairs = sorted(
+                (d.get("pairs") or []),
+                key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0),
+                reverse=True,
+            )
+            if pairs:
+                best = pairs[0]
+                price = best.get("priceUsd")
+                liq   = float((best.get("liquidity") or {}).get("usd") or 0)
+                return (float(price) if price else None), liq
+        except Exception as e:
+            log.warning("dex_price_liq_failed", mint=mint[:8], error=str(e))
+        return None, 0.0
 
     async def _fetch_price_dex(self, mint: str, min_liq: float = 10_000) -> Optional[float]:
         if not mint:

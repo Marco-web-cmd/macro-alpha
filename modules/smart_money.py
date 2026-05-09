@@ -24,6 +24,8 @@ log = structlog.get_logger()
 
 HELIUS_KEY  = os.getenv("HELIUS_API_KEY", "")
 HELIUS_BASE = f"https://api.helius.xyz/v0"
+RPC_URL     = (os.getenv("SOLANA_RPC_URL")
+               or f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}")
 
 # Mints considérés comme "stablecoins / SOL" → le wallet vend ces tokens
 # pour acheter autre chose. Si on les voit en sortie, c'est un achat.
@@ -236,52 +238,64 @@ class SmartMoneyTracker:
                 log.warning("smart_money_poll_error",
                             wallet=label, error=str(e))
 
-    async def _fetch_and_filter(self, addr: str, label: str, initial: bool):
-        """
-        Récupère les 10 derniers SWAPs du wallet via Helius Enhanced API.
-        Si initial=True, enregistre les sigs sans appeler le callback.
-        """
+    async def _get_session(self):
         import aiohttp, ssl, certifi
-
-        if not hasattr(self, "_session") or self._session is None:
+        if not hasattr(self, "_session") or self._session is None or self._session.closed:
             ctx = ssl.create_default_context(cafile=certifi.where())
             self._session = aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=ctx, limit=5),
+                connector=aiohttp.TCPConnector(ssl=ctx, limit=10),
                 timeout=aiohttp.ClientTimeout(total=12),
                 headers={"User-Agent": "macro_alpha/7.0"},
             )
+        return self._session
 
-        url = (
-            f"{HELIUS_BASE}/addresses/{addr}/transactions"
-            f"?api-key={HELIUS_KEY}&type=SWAP&limit=10"
-        )
+    async def _rpc(self, method: str, params: list) -> dict:
+        """Appel RPC Solana basique (gratuit, pas de quota Helius Enhanced)."""
+        session = await self._get_session()
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         try:
-            async with self._session.get(url) as r:
-                if r.status == 429:
-                    log.warning("smart_money_rate_limited", wallet=label)
-                    return
+            async with session.post(RPC_URL, json=payload) as r:
                 if r.status != 200:
-                    return
-                txs = await r.json()
+                    return {}
+                return await r.json()
         except Exception as e:
-            log.warning("smart_money_fetch_failed", wallet=label, error=str(e))
-            return
+            log.warning("smart_money_rpc_failed", method=method, error=str(e))
+            return {}
 
-        if not isinstance(txs, list):
+    async def _fetch_and_filter(self, addr: str, label: str, initial: bool):
+        """
+        Récupère les signatures récentes via getSignaturesForAddress (RPC gratuit)
+        puis parse chaque nouvelle transaction pour détecter les achats de tokens.
+        Remplace l'ancienne approche Helius Enhanced API (payante / quota limité).
+        """
+        resp = await self._rpc(
+            "getSignaturesForAddress",
+            [addr, {"limit": 15, "commitment": "confirmed"}],
+        )
+        sigs_raw = resp.get("result") or []
+        if not sigs_raw:
             return
 
         seen = self._seen_sigs.get(addr, set())
+        new_sigs = [
+            s["signature"] for s in sigs_raw
+            if s.get("signature") and s["signature"] not in seen and not s.get("err")
+        ]
 
-        for tx in txs:
-            sig = tx.get("signature", "")
-            if not sig or sig in seen:
-                continue
+        for sig in new_sigs:
             seen.add(sig)
-
             if initial:
-                continue  # Premier poll : on mémorise sans trader
+                continue
 
-            buy = self._parse_buy(tx, addr)
+            tx_resp = await self._rpc(
+                "getTransaction",
+                [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}],
+            )
+            tx = tx_resp.get("result")
+            if not tx:
+                continue
+
+            buy = self._parse_buy_rpc(tx, addr)
             if buy:
                 buy["wallet"]       = addr
                 buy["wallet_label"] = label
@@ -292,23 +306,78 @@ class SmartMoneyTracker:
                          sol_spent=buy.get("sol_spent", 0))
                 asyncio.create_task(self._fire(buy))
 
-        self._seen_sigs[addr] = seen
+            await asyncio.sleep(0.1)  # évite le rate-limit RPC sur les getTransaction
 
-        # Mémoire courte : évite les leaks sur wallet très actif
+        self._seen_sigs[addr] = seen
         if len(seen) > 5_000:
             self._seen_sigs[addr] = set(list(seen)[-2_500:])
 
+    def _parse_buy_rpc(self, tx: dict, wallet: str) -> Optional[dict]:
+        """
+        Parse une transaction RPC jsonParsed pour détecter un achat de token.
+        Compare preTokenBalances vs postTokenBalances pour trouver les tokens
+        reçus par le wallet, et preBalances vs postBalances pour le SOL dépensé.
+        Fonctionne avec n'importe quel DEX (Jupiter, Raydium, Orca, Pump.fun).
+        """
+        meta = tx.get("meta") or {}
+        if meta.get("err"):
+            return None
+
+        pre_tok  = {b["accountIndex"]: b for b in (meta.get("preTokenBalances")  or [])}
+        post_tok = {b["accountIndex"]: b for b in (meta.get("postTokenBalances") or [])}
+        pre_nat  = meta.get("preBalances")  or []
+        post_nat = meta.get("postBalances") or []
+
+        account_keys = (tx.get("transaction") or {}).get("message", {}).get("accountKeys", [])
+
+        def _pubkey(k):
+            return k if isinstance(k, str) else k.get("pubkey", "")
+
+        # Indices des comptes appartenant au wallet
+        wallet_indices = {i for i, k in enumerate(account_keys) if _pubkey(k) == wallet}
+
+        token_received: Optional[str] = None
+
+        # Cherche un token non-stable dont le solde du wallet a augmenté
+        all_indices = set(list(pre_tok.keys()) + list(post_tok.keys()))
+        for idx in all_indices:
+            pre  = pre_tok.get(idx, {})
+            post = post_tok.get(idx, {})
+            owner = post.get("owner") or pre.get("owner", "")
+            if owner != wallet:
+                continue
+            mint = post.get("mint") or pre.get("mint", "")
+            if not mint or mint in _STABLE_MINTS:
+                continue
+            pre_amt  = float((pre.get("uiTokenAmount")  or {}).get("uiAmount") or 0)
+            post_amt = float((post.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+            if post_amt > pre_amt:
+                token_received = mint
+                break
+
+        if not token_received:
+            return None
+
+        # Estime le SOL dépensé via le delta de balance native du wallet
+        sol_spent = 0.0
+        for i, k in enumerate(account_keys):
+            if _pubkey(k) == wallet and i < len(pre_nat) and i < len(post_nat):
+                delta = (pre_nat[i] - post_nat[i]) / 1e9  # lamports → SOL
+                if delta > 0:
+                    sol_spent += delta
+
+        if sol_spent < MIN_SOL_SPENT:
+            return None
+
+        return {
+            "mint":      token_received,
+            "symbol":    token_received[:8].upper(),
+            "sol_spent": round(sol_spent, 4),
+            "timestamp": tx.get("blockTime", int(time.time())),
+        }
+
     def _parse_buy(self, tx: dict, wallet: str) -> Optional[dict]:
-        """
-        Analyse une transaction SWAP pour détecter si le wallet achète un token.
-
-        Logique :
-          - tokenTransfers où toUserAccount == wallet et mint non-stable → TOKEN REÇU
-          - tokenTransfers où fromUserAccount == wallet et mint stable → SOL/USDC ENVOYÉ
-          → Si les deux conditions sont vraies : c'est un achat
-
-        Retourne None si c'est une vente ou une transaction non pertinente.
-        """
+        """Parse format Helius Enhanced (utilisé uniquement par handle_webhook_event)."""
         transfers = tx.get("tokenTransfers", [])
         if not transfers:
             return None
@@ -321,33 +390,20 @@ class SmartMoneyTracker:
             mint   = t.get("mint", "")
             to_acc = t.get("toUserAccount", "")
             fr_acc = t.get("fromUserAccount", "")
-            amount = float(t.get("tokenAmount") or 0)
 
-            # Le wallet REÇOIT un token non-stable → candidat "buy"
             if to_acc == wallet and mint and mint not in _STABLE_MINTS:
                 token_received  = mint
                 symbol_received = t.get("tokenStandard", "") or mint[:8]
 
-            # Le wallet ENVOIE un stable (SOL/USDC) → mesure ce qu'il dépense
             if fr_acc == wallet and mint in _STABLE_MINTS:
-                # SOL a 9 décimales, USDC a 6 — on approxime en SOL
+                amount = float(t.get("tokenAmount") or 0)
                 if mint == "So11111111111111111111111111111111111111112":
                     sol_spent += amount
                 else:
-                    sol_spent += amount / 150.0   # approx USDC→SOL
+                    sol_spent += amount / 150.0
 
-        if not token_received:
+        if not token_received or sol_spent < MIN_SOL_SPENT:
             return None
-
-        # Ignore les micro-achats (test / dust)
-        if sol_spent < MIN_SOL_SPENT:
-            return None
-
-        # Récupère le symbole depuis accountData si disponible
-        for acc in tx.get("accountData", []):
-            if acc.get("account") == token_received:
-                sym = (acc.get("tokenBalanceChanges") or [{}])[0]
-                symbol_received = sym.get("userAccount", symbol_received)
 
         return {
             "mint":      token_received,
