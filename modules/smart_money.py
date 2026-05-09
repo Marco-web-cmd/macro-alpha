@@ -90,7 +90,12 @@ class SmartMoneyTracker:
 
     @property
     def wallet_count(self) -> int:
-        return len(self._active_wallets)
+        # Avant start() : _active_wallets vide → compte les sources disponibles
+        # Après start() : retourne le nombre de wallets réellement trackés
+        if self._active_wallets:
+            return len(self._active_wallets)
+        # Compte les wallets .env + 1 si Birdeye configuré (Birdeye va en trouver)
+        return len(SMART_MONEY_WALLETS) + (1 if BIRDEYE_KEY else 0)
 
     # ── Découverte automatique via Birdeye ────────────────────
 
