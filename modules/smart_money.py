@@ -1,20 +1,15 @@
 """
 smart_money.py — Copy trading intelligent sur wallets Solana rentables.
 
-Fonctionnement :
-  1. Poll Helius Enhanced Transactions API toutes les 60s par wallet
-  2. Détecte les SWAP où le wallet achète un token (reçoit TOKEN, envoie SOL/USDC)
-  3. Callback avec {"mint", "symbol", "wallet", "wallet_label", "source": "copy"}
-  4. Le bot filtre via son scoring + preflight avant d'entrer
+Sources de wallets (par priorité) :
+  1. Birdeye /trader/gainers-losers — top traders par PnL sur 7j (auto-refresh 12h)
+  2. SMART_MONEY_WALLETS dans .env — wallets manuels (complément ou fallback)
 
-Configuration :
-  SMART_MONEY_WALLETS=addr1:label1,addr2:label2  dans .env
-  (label optionnel — sert uniquement pour les logs)
-
-Critères "smart money" recommandés pour la sélection manuelle :
-  - >= 100 trades on-chain
-  - Win rate > 55%
-  - Pas de multi-sig ni de bot évident (timestamp trop réguliers)
+Détection des achats :
+  - getSignaturesForAddress + getTransaction via RPC basique gratuit (sans quota Helius)
+  - Analyse preTokenBalances vs postTokenBalances pour détecter tout DEX (Jupiter/Raydium/Orca)
+  - Callback avec {"mint", "symbol", "wallet", "wallet_label", "source": "copy"}
+  - Le bot filtre via son scoring + preflight avant d'entrer
 """
 import os, asyncio, time
 from typing import Callable, Optional, Set
@@ -22,10 +17,18 @@ import structlog
 
 log = structlog.get_logger()
 
-HELIUS_KEY  = os.getenv("HELIUS_API_KEY", "")
-HELIUS_BASE = f"https://api.helius.xyz/v0"
-RPC_URL     = (os.getenv("SOLANA_RPC_URL")
-               or f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}")
+HELIUS_KEY   = os.getenv("HELIUS_API_KEY", "")
+HELIUS_BASE  = f"https://api.helius.xyz/v0"
+BIRDEYE_KEY  = os.getenv("BIRDEYE_API_KEY", "")
+RPC_URL      = (os.getenv("SOLANA_RPC_URL")
+                or f"https://mainnet.helius-rpc.com/?api-key={HELIUS_KEY}"
+                or "https://api.mainnet-beta.solana.com")
+
+# Critères de sélection des wallets Birdeye
+BIRDEYE_MIN_TRADES  = 50        # ignore les wallets < 50 trades (pas assez de data)
+BIRDEYE_MIN_PNL     = 5_000     # PnL minimum en USD sur 7j
+BIRDEYE_MAX_WALLETS = 15        # max wallets trackés depuis Birdeye
+WALLET_REFRESH_H    = 12        # refresh de la liste toutes les 12h
 
 # Mints considérés comme "stablecoins / SOL" → le wallet vend ces tokens
 # pour acheter autre chose. Si on les voit en sortie, c'est un achat.
@@ -64,50 +67,121 @@ def _parse_wallets() -> list[dict]:
     return wallets
 
 
-SMART_MONEY_WALLETS = _parse_wallets()
+SMART_MONEY_WALLETS = _parse_wallets()  # wallets manuels depuis .env (fallback)
 
 
 class SmartMoneyTracker:
     """
     Surveille les wallets smart money en temps réel.
-
-    Mode 1 — Helius Webhooks (prioritaire) :
-      Helius pousse les transactions instantanément via POST /api/helius-webhook.
-      L'app.py appelle handle_webhook_event() → latence < 1s.
-
-    Mode 2 — Polling fallback (15s) :
-      Si les webhooks ne sont pas configurés ou échouent, polling toutes les 15s
-      (vs 60s avant = 4x plus rapide).
+    - Source principale : Birdeye top traders 7j (auto-refresh toutes les 12h)
+    - Fallback : SMART_MONEY_WALLETS depuis .env
+    - Polling via RPC basique gratuit (getSignaturesForAddress + getTransaction)
     """
 
-    POLL_INTERVAL  = 15   # réduit de 60s → 15s
-    WEBHOOK_SERVER = os.getenv("PUBLIC_URL", "")  # ex: http://35.225.188.104:5001
+    POLL_INTERVAL = 15  # secondes entre chaque poll par wallet
 
     def __init__(self):
-        self._running    = False
+        self._running  = False
         self._tasks: list[asyncio.Task] = []
         self._seen_sigs: dict[str, Set[str]] = {}
         self._callback: Optional[Callable] = None
-        self._webhook_id: Optional[str]    = None
-        self._webhook_active: bool         = False
+        self._active_wallets: list[dict]  = []  # liste dynamique (Birdeye + env)
+        self._polled_addrs: Set[str]      = set()  # adresses déjà en cours de poll
 
     @property
     def wallet_count(self) -> int:
-        return len(SMART_MONEY_WALLETS)
+        return len(self._active_wallets)
+
+    # ── Découverte automatique via Birdeye ────────────────────
+
+    async def _fetch_top_wallets_birdeye(self) -> list[dict]:
+        """
+        Récupère les meilleurs traders Solana sur 7j depuis Birdeye.
+        Filtre : PnL > BIRDEYE_MIN_PNL, trade_count >= BIRDEYE_MIN_TRADES.
+        Trie par PnL/trade (rentabilité par trade) pour favoriser l'efficacité.
+        """
+        if not BIRDEYE_KEY:
+            return []
+        session = await self._get_session()
+        try:
+            async with session.get(
+                "https://public-api.birdeye.so/trader/gainers-losers"
+                "?time_frame=7d&sort_by=PnL&sort_type=desc&limit=50",
+                headers={"X-API-KEY": BIRDEYE_KEY, "x-chain": "solana"},
+            ) as r:
+                if r.status != 200:
+                    log.warning("birdeye_traders_failed", status=r.status)
+                    return []
+                d = await r.json()
+        except Exception as e:
+            log.warning("birdeye_traders_error", error=str(e))
+            return []
+
+        items = (d.get("data") or {}).get("items") or []
+        wallets = []
+        for w in items:
+            addr        = w.get("address", "")
+            pnl         = float(w.get("pnl") or 0)
+            trade_count = int(w.get("trade_count") or 0)
+            if len(addr) < 32 or pnl < BIRDEYE_MIN_PNL or trade_count < BIRDEYE_MIN_TRADES:
+                continue
+            # PnL/trade = efficacité (évite les wallets chanceux à 2 trades)
+            pnl_per_trade = pnl / max(trade_count, 1)
+            wallets.append({
+                "address":       addr,
+                "label":         f"BE_{addr[:6]}",
+                "pnl_7d":        round(pnl),
+                "trade_count":   trade_count,
+                "pnl_per_trade": pnl_per_trade,
+            })
+
+        # Trie par PnL/trade et garde les meilleurs
+        wallets.sort(key=lambda x: x["pnl_per_trade"], reverse=True)
+        return wallets[:BIRDEYE_MAX_WALLETS]
+
+    async def _wallet_discovery_loop(self):
+        """Rafraîchit la liste des wallets depuis Birdeye toutes les WALLET_REFRESH_H heures."""
+        while self._running:
+            try:
+                discovered = await self._fetch_top_wallets_birdeye()
+                if discovered:
+                    await self._update_wallet_list(discovered)
+                    log.info("smart_money_wallets_refreshed",
+                             count=len(discovered),
+                             top=discovered[0]["label"] if discovered else "")
+            except Exception as e:
+                log.warning("wallet_discovery_error", error=str(e))
+            # Attend WALLET_REFRESH_H avant le prochain refresh
+            for _ in range(WALLET_REFRESH_H * 360):  # check self._running toutes les 10s
+                if not self._running:
+                    return
+                await asyncio.sleep(10)
+
+    async def _update_wallet_list(self, new_wallets: list[dict]):
+        """
+        Ajoute les nouveaux wallets à la liste active et lance leurs poll tasks.
+        Ne remet pas en cause les wallets déjà en cours de poll.
+        """
+        for w in new_wallets:
+            addr = w["address"]
+            if addr not in self._polled_addrs:
+                self._active_wallets.append(w)
+                self._seen_sigs[addr] = set()
+                self._polled_addrs.add(addr)
+                task = asyncio.create_task(self._poll_loop(w))
+                self._tasks.append(task)
+                log.info("smart_money_wallet_added",
+                         label=w["label"], pnl_7d=w.get("pnl_7d", 0))
 
     async def handle_webhook_event(self, events: list):
-        """
-        Appelé par app.py quand Helius pousse un événement webhook.
-        Traite la liste d'événements et déclenche le callback si c'est un achat.
-        """
+        """Appelé par app.py si Helius pousse un événement webhook (bonus si dispo)."""
         if not self._callback or not self._running:
             return
         for tx in events:
             sig = tx.get("signature", "")
             if not sig:
                 continue
-            # Trouve quel wallet est concerné
-            for w in SMART_MONEY_WALLETS:
+            for w in self._active_wallets:
                 seen = self._seen_sigs.get(w["address"], set())
                 if sig in seen:
                     continue
@@ -115,101 +189,45 @@ class SmartMoneyTracker:
                 self._seen_sigs[w["address"]] = seen
                 buy = self._parse_buy(tx, w["address"])
                 if buy:
-                    buy["wallet"]       = w["address"]
-                    buy["wallet_label"] = w["label"]
-                    buy["signature"]    = sig
-                    buy["source"]       = "copy"
+                    buy.update({"wallet": w["address"], "wallet_label": w["label"],
+                                "signature": sig, "source": "copy"})
                     log.info("smart_money_webhook_buy",
                              wallet=w["label"], mint=buy["mint"][:8])
                     asyncio.create_task(self._fire(buy))
 
-    async def _register_webhook(self):
-        """
-        Enregistre (ou met à jour) un webhook Helius pour les wallets configurés.
-        Nécessite PUBLIC_URL dans .env — ex: http://35.225.188.104:5001
-        """
-        if not self.WEBHOOK_SERVER or not HELIUS_KEY:
-            return False
-        webhook_url = f"{self.WEBHOOK_SERVER}/api/helius-webhook"
-        addresses   = [w["address"] for w in SMART_MONEY_WALLETS]
-        payload = {
-            "webhookURL":       webhook_url,
-            "transactionTypes": ["SWAP"],
-            "accountAddresses": addresses,
-            "webhookType":      "enhanced",
-        }
-        import aiohttp, ssl, certifi
-        ctx = ssl.create_default_context(cafile=certifi.where())
-        try:
-            async with aiohttp.ClientSession(
-                connector=aiohttp.TCPConnector(ssl=ctx)
-            ) as session:
-                # Liste les webhooks existants
-                async with session.get(
-                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}"
-                ) as r:
-                    existing = await r.json() if r.status == 200 else []
-
-                # Supprime les anciens webhooks sur notre URL
-                for wh in (existing if isinstance(existing, list) else []):
-                    if wh.get("webhookURL") == webhook_url:
-                        wid = wh.get("webhookID", "")
-                        if wid:
-                            await session.delete(
-                                f"https://api.helius.xyz/v0/webhooks/{wid}?api-key={HELIUS_KEY}"
-                            )
-
-                # Crée le nouveau webhook
-                async with session.post(
-                    f"https://api.helius.xyz/v0/webhooks?api-key={HELIUS_KEY}",
-                    json=payload,
-                ) as r:
-                    if r.status in (200, 201):
-                        data = await r.json()
-                        self._webhook_id     = data.get("webhookID")
-                        self._webhook_active = True
-                        log.info("smart_money_webhook_registered",
-                                 id=self._webhook_id, url=webhook_url,
-                                 wallets=len(addresses))
-                        return True
-                    else:
-                        body = await r.text()
-                        log.warning("smart_money_webhook_failed",
-                                    status=r.status, body=body[:200])
-                        return False
-        except Exception as e:
-            log.warning("smart_money_webhook_error", error=str(e))
-            return False
-
     async def start(self, callback: Callable):
-        if not HELIUS_KEY:
-            log.warning("smart_money_disabled", reason="HELIUS_API_KEY manquant")
-            return
-        if not SMART_MONEY_WALLETS:
-            log.warning("smart_money_disabled",
-                        reason="SMART_MONEY_WALLETS vide — configure dans .env")
-            return
-
         self._running  = True
         self._callback = callback
+
+        # 1. Charge les wallets manuels depuis .env (disponibles immédiatement)
         for w in SMART_MONEY_WALLETS:
+            self._active_wallets.append(w)
             self._seen_sigs[w["address"]] = set()
+            self._polled_addrs.add(w["address"])
 
-        # Tente d'enregistrer les webhooks Helius (temps réel)
-        webhook_ok = await self._register_webhook()
-        if not webhook_ok:
-            log.info("smart_money_polling_mode",
-                     interval=self.POLL_INTERVAL,
-                     hint="Configure PUBLIC_URL dans .env pour activer les webhooks")
+        # 2. Découverte Birdeye au démarrage
+        discovered = await self._fetch_top_wallets_birdeye()
+        if discovered:
+            await self._update_wallet_list(discovered)
+            log.info("smart_money_birdeye_discovery",
+                     found=len(discovered),
+                     top3=[w["label"] for w in discovered[:3]])
+        elif not SMART_MONEY_WALLETS:
+            log.warning("smart_money_no_wallets",
+                        reason="Birdeye discovery vide et SMART_MONEY_WALLETS non configuré")
 
-        # Lance toujours le polling en parallèle (fallback ou backup)
+        # 3. Lance les polls pour les wallets manuels (.env)
         for w in SMART_MONEY_WALLETS:
             task = asyncio.create_task(self._poll_loop(w))
             self._tasks.append(task)
 
+        # 4. Lance le refresh périodique Birdeye
+        self._tasks.append(asyncio.create_task(self._wallet_discovery_loop()))
+
         log.info("smart_money_started",
-                 wallets=[w["label"] for w in SMART_MONEY_WALLETS],
-                 webhook=webhook_ok,
+                 manual_wallets=len(SMART_MONEY_WALLETS),
+                 birdeye_wallets=len(discovered) if discovered else 0,
+                 total=len(self._active_wallets),
                  poll_interval=self.POLL_INTERVAL)
 
     async def stop(self):
